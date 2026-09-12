@@ -1,21 +1,32 @@
 /**
  * 认证：PIN 哈希、会话签发与校验、暴力破解限速。
  *
- * ⚠️ Workers 免费版每个请求只有 10ms CPU 时间，超了直接返回 Error 1102 崩掉。
- * 实测（Node，通常比 Workers 沙箱快）：
- *   PBKDF2-SHA256  50,000 轮 → 6.53 ms
- *   PBKDF2-SHA256 100,000 轮 → 13.71 ms   ← 已超预算
- *   PBKDF2-SHA256 600,000 轮 → 80.27 ms   ← OWASP 推荐值，在免费版上必崩
- *   HMAC-SHA256              → 0.080 ms   ← 几乎免费
+ * ⚠️ Workers 免费版每个请求只有 10ms CPU 时间，超了会被掐断（Error 1102）。
  *
- * 因此这里采用 [HMAC-SHA256(pepper) → PBKDF2(25,000 轮)] 的组合：
- * pepper 是不入库的高熵密钥，承担了主要的抗离线爆破职责，所以轮数可以
- * 降到 25,000（实测 3.38ms）而安全性不打折——攻击者拿到数据库也缺一半输入。
+ * 轮数是在线上实测出来的，不是照着推荐值抄的。踩过的坑：
  *
- * 部署后请用 `npx wrangler tail` 观察 cpuTime，确认留有安全余量。
+ *   本机 Node 跑 PBKDF2-SHA256 25,000 轮只要 3.3ms，
+ *   但同一段代码在 Cloudflare 上要 10~13ms——差了 3 倍多。
+ *   照本机基准去选轮数，线上必然翻车。
+ *
+ * 线上实测（`wrangler tail --format json` 读 cpuTime）：
+ *   PBKDF2-SHA256 25,000 轮 → 登录接口整体 10~14ms，创建房间 17ms  ← 超限
+ *   PBKDF2-SHA256  6,000 轮 → 见下方注释，留出余量
+ *   HMAC-SHA256             → 0.08ms，几乎免费
+ *
+ * 架构是 [HMAC-SHA256(pepper) → PBKDF2(n 轮)]。
+ * pepper 是不入库的高熵密钥，承担了主要的抗离线爆破职责——攻击者拖走数据库
+ * 也缺一半输入，拿不到 pepper 就一步都走不了。PBKDF2 是第二道防线，
+ * 只在「数据库和 pepper 同时泄露」时才有意义，因此轮数可以压到 CPU 预算之内。
+ *
+ * 关于 4 位 PIN：就算按 OWASP 推荐值上 600,000 轮，1 万种组合也只要 30 分钟就能穷举完，
+ * 轮数救不了短 PIN。真正拦住猜 PIN 的是登录失败锁定（5 次锁 15 分钟）——那是硬约束，
+ * 因为它在服务端累加，绕不过去。想更安全请用长密码短语，界面里已经这么引导了。
+ *
+ * 改动轮数不会让老哈希失效：轮数写在哈希串里，校验时从串里读。
  */
 
-const PBKDF2_ITERATIONS = 25_000;
+const PBKDF2_ITERATIONS = 6_000;
 const PBKDF2_HASH = 'pbkdf2-sha256';
 const SALT_BYTES = 16;
 const SESSION_TOKEN_BYTES = 32;

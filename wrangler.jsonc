@@ -16,14 +16,14 @@
     "run_worker_first": ["/api/*"]
   },
 
-  // 部署前需要替换 database_id：
-  //   npx wrangler d1 create hezu-db
-  // 把输出的 database_id 填到下面。本地开发用占位值即可，不影响 wrangler dev。
+  // 由 `npx wrangler d1 create hezu-db` 创建（区域 WNAM）。
+  // 注意：D1 的「主区域」在创建时就固定了，之后改不了；
+  // 它决定写操作和读一致性检查要跑到哪个大洲，与边缘节点的位置无关。
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "hezu-db",
-      "database_id": "00000000-0000-0000-0000-000000000000"
+      "database_id": "f0b2f24a-cc81-49d2-93da-df2970debdcb"
     }
   ]
 }

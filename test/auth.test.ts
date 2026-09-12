@@ -67,8 +67,8 @@ describe('hashPin / verifyPin', () => {
 });
 
 describe('单次哈希的 CPU 成本', () => {
-  it('明显低于 Workers 免费版的 10ms CPU 上限', async () => {
-    await hashPin('1234', PEPPER); // 预热
+  it('按线上实测的换算比例，仍在 Workers 免费版 10ms 上限内', async () => {
+    await hashPin('1234', PEPPER); // 预热，避开 JIT 和首次 WebCrypto 初始化的开销
 
     const runs: number[] = [];
     for (let i = 0; i < 5; i++) {
@@ -78,9 +78,21 @@ describe('单次哈希的 CPU 成本', () => {
     }
     const avg = runs.reduce((a, b) => a + b, 0) / runs.length;
 
-    // 本地 Node 比 Workers 沙箱快，留足余量。若这条断言失败，
-    // 说明 PBKDF2_ITERATIONS 需要下调，否则线上会触发 Error 1102。
-    expect(avg).toBeLessThan(8);
+    // ⚠️ 这条断言只测本机，而本机比 Cloudflare 快约 3 倍——这是踩过的坑：
+    //    25,000 轮在本机是 3.3ms，看着很安全，线上实测却是 10~13ms，直接超限。
+    //    所以本机阈值必须按 3 倍折算：本机 3ms ≈ 线上 9ms，留 1ms 余量。
+    //    阈值 8ms 是错的，那相当于线上 24ms，必崩。
+    const CLOUDFLARE_SLOWDOWN = 3;
+    const CLOUDFLARE_BUDGET_MS = 10;
+
+    expect(avg * CLOUDFLARE_SLOWDOWN).toBeLessThan(CLOUDFLARE_BUDGET_MS);
+  });
+
+  it('本机阈值按 3 倍折算后不超过 3ms（防止有人悄悄调高轮数）', async () => {
+    await hashPin('1234', PEPPER);
+    const t0 = performance.now();
+    await hashPin('1234', PEPPER);
+    expect(performance.now() - t0).toBeLessThan(3);
   });
 });
 

@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hezu-life-manager",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2025-09-01",
+  "observability": {
+    "enabled": true
+  },
+
+  // 静态资源：Vite 构建产物。SPA 路由回退到 index.html。
+  // run_worker_first 只放行 /api/*，其余请求直接走静态资源，不消耗 Worker 调用次数。
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+
+  // 部署前需要替换 database_id：
+  //   npx wrangler d1 create hezu-db
+  // 把输出的 database_id 填到下面。本地开发用占位值即可，不影响 wrangler dev。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hezu-db",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}

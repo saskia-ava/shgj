@@ -131,6 +131,12 @@ cloudflare.com（Cloudflare 自家域名）
 
 再 `npm run deploy` 即可。域名不变，之后所有迭代都在这一个域名下更新。
 
-## 许可
+## 许可与可见性
 
-私有项目。
+代码托管在公开仓库 [saskia-ava/shgj](https://github.com/saskia-ava/shgj)，**任何人可见**。
+
+但「公开可见」不等于「授权使用」：本项目**未授予任何使用许可**（All rights reserved）。你可以阅读代码，但未经许可不得复制、修改、分发或用于自己的项目。
+
+之所以公开而不加密，是因为仓库里**不含任何密钥**——`PIN_PEPPER` 走的是 `.dev.vars`（本地）和 `wrangler secret`（线上），两者都在 `.gitignore` 里，从未进入版本历史。源码公开不会导致任何人的数据被访问。
+
+> 如果你后来改主意想转为私有仓库：GitHub 仓库 Settings → General → 页面底部 Danger Zone → Change visibility → Private。**改可见性不影响 Cloudflare 部署和线上链接**，网站照常对外服务。

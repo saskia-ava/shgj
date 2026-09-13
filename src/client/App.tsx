@@ -1,6 +1,15 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type Member, type Session } from './api';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { api, ApiError, type ActiveSession, type Member, type Session } from './api';
 import AuthPage from './pages/AuthPage';
+import HouseholdGate from './pages/HouseholdGate';
 import Dashboard from './pages/Dashboard';
 import Expenses from './pages/Expenses';
 import Balance from './pages/Balance';
@@ -10,7 +19,12 @@ import Items from './pages/Items';
 import Members from './pages/Members';
 
 export interface AppContextValue {
-  session: Session;
+  /**
+   * ⚠️ 类型是 ActiveSession（household / member 保证非空），不是 Session。
+   *    「已登录但没选房间」这个中间态被挡在 Provider 之外，所以页面组件里
+   *    可以放心写 session.member.id，不需要到处判空。
+   */
+  session: ActiveSession;
   members: Member[];
   activeMembers: Member[];
   nameOf: (id: string) => string;
@@ -103,6 +117,48 @@ export default function App() {
     }
   }, []);
 
+  // 切到别的房间时只刷新会话，不清 members——members 会由下面那个
+  // 「session 变了就重拉」的 effect 负责，避免两处同时改状态。
+  const switchHousehold = useCallback(async (householdId: string) => {
+    const me = await api.switchHousehold(householdId);
+    setSession(me);
+  }, []);
+
+  // 多标签页共享同一个 cookie：在 A 标签页切了房间，B 标签页并不知道，
+  // 会继续往记忆中的旧房间写数据。这里在标签页重新可见时对一次账，
+  // 发现当前房间变了就同步过来。
+  //
+  // 这只解决了「切回来的时候能发现」，切过去的瞬间仍可能写错一两条。
+  // 彻底解决需要跨标签页通信，成本远大于收益。README 里把它列为已知限制。
+  const sessionRef = useRef<Session | null>(null);
+  sessionRef.current = session;
+
+  useEffect(() => {
+    const syncIfChanged = async () => {
+      if (document.visibilityState !== 'visible') return;
+      const current = sessionRef.current;
+      if (!current) return; // 未登录时不折腾
+
+      try {
+        const me = await api.me();
+        // 只在「当前房间或身份真的变了」时才更新，否则每次切标签页都会
+        // 触发一轮全量刷新
+        if (me.household?.id !== current.household?.id || me.member?.id !== current.member?.id) {
+          setSession(me);
+        }
+      } catch {
+        // 网络问题或会话已失效。失效的情况由各请求自己的 401 处理兜底。
+      }
+    };
+
+    document.addEventListener('visibilitychange', syncIfChanged);
+    window.addEventListener('focus', syncIfChanged);
+    return () => {
+      document.removeEventListener('visibilitychange', syncIfChanged);
+      window.removeEventListener('focus', syncIfChanged);
+    };
+  }, []);
+
   const activeMembers = useMemo(() => members.filter((m) => m.isActive), [members]);
 
   const nameOf = useCallback(
@@ -110,12 +166,27 @@ export default function App() {
     [members],
   );
 
+  // 三态里的第三态：会话、房间、身份三者齐全，才能进主界面
+  const activeSession: ActiveSession | null =
+    session && session.household && session.member
+      ? (session as ActiveSession)
+      : null;
+  const householdId = activeSession?.household.id ?? null;
+
   const ctxValue: AppContextValue | null = useMemo(
     () =>
-      session
-        ? { session, members, activeMembers, nameOf, reloadMembers, reloadSession, logout }
+      activeSession
+        ? {
+            session: activeSession,
+            members,
+            activeMembers,
+            nameOf,
+            reloadMembers,
+            reloadSession,
+            logout,
+          }
         : null,
-    [session, members, activeMembers, nameOf, reloadMembers, reloadSession, logout],
+    [activeSession, members, activeMembers, nameOf, reloadMembers, reloadSession, logout],
   );
 
   if (booting) {
@@ -127,31 +198,52 @@ export default function App() {
     );
   }
 
-  if (!session || !ctxValue) {
-    return (
-      <AuthPage
-        onAuthed={async () => {
-          await reloadSession();
-        }}
-      />
-    );
+  // 第一态：没登录
+  if (!session) {
+    return <AuthPage onAuthed={reloadSession} />;
+  }
+
+  // 第二态：登录了，但当前房间下没有身份（还没选房间，或已从该房间退租）
+  if (!activeSession || !ctxValue) {
+    return <HouseholdGate session={session} onChanged={reloadSession} onLogout={logout} />;
   }
 
   return (
-    <AppContext.Provider value={ctxValue}>
+    // ⚠️ key={householdId} 是这里性价比最高的一行：切换房间时整个子树会被
+    //    卸载重建，所有页面组件里的 useState 全部归零。没有它就会出现
+    //    「切到 B 房了，记账页还预填着 A 房的成员和分类」这类静默写错房间的
+    //    bug——而且不会报错，只会把数据写到看不见的地方去。
+    <AppContext.Provider value={ctxValue} key={householdId}>
       <div className="app">
         <header className="topbar">
           <div className="topbar-inner">
             <div style={{ minWidth: 0 }}>
-              <h1>{session.household.name}</h1>
+              <h1>{activeSession.household.name}</h1>
               <div className="topbar-sub">
-                你好，{session.member.name}
-                {session.member.room ? ` · ${session.member.room}` : ''}
+                你好，{activeSession.member.name}
+                {activeSession.member.room ? ` · ${activeSession.member.room}` : ''}
               </div>
             </div>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={logout}>
-              退出
-            </button>
+            <div className="topbar-actions">
+              {session.households.length > 1 && (
+                <label className="household-switch">
+                  <span className="sr-only">切换房间</span>
+                  <select
+                    value={activeSession.household.id}
+                    onChange={(e) => void switchHousehold(e.target.value)}
+                  >
+                    {session.households.map((h) => (
+                      <option key={h.id} value={h.id}>
+                        {h.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+              <button type="button" className="btn btn-ghost btn-sm" onClick={logout}>
+                退出
+              </button>
+            </div>
           </div>
 
           <nav className="tabs">
@@ -174,9 +266,8 @@ export default function App() {
         </header>
 
         <main className="main">
-          {/* 会话过期时（例如服务器重启或清理了会话表）统一在这里兜底，
-              避免每个页面各写一遍 401 处理 */}
-          <SessionExpiryGuard onExpired={logout} />
+          {/* 会话过期 / 失去房间身份时统一在这里兜底，避免每个页面各写一遍 */}
+          <SessionExpiryGuard onExpired={logout} onNoMembership={reloadSession} />
 
           {tab === 'dashboard' && <Dashboard onNavigate={(key) => setTab(key as TabKey)} />}
           {tab === 'expenses' && <Expenses />}
@@ -192,17 +283,33 @@ export default function App() {
 }
 
 /**
- * 会话失效兜底。
+ * 登录态失效兜底。两个事件分别处理，**不能合并**：
  *
- * 各页面的请求如果返回 401，说明 cookie 已失效（过期、被清理、或换了设备）。
- * 这里监听一个全局事件，统一退回登录页，而不是让每个页面各自处理。
+ *   hzm:unauthorized  —— 会话真失效了（过期、被清理、换了设备）。退回登录页，
+ *                        并且要把本地状态清干净（走 logout 而不是只 reload）。
+ *   hzm:no-membership —— 登录着，但当前房间下没有身份了。这时**千万不能**
+ *                        退回登录页：用户重登一次会回到完全一样的状态，
+ *                        永远出不来。正确做法是重新拉一次 /me，让 App
+ *                        渲染出房间选择页。
  */
-function SessionExpiryGuard({ onExpired }: { onExpired: () => void }) {
+function SessionExpiryGuard({
+  onExpired,
+  onNoMembership,
+}: {
+  onExpired: () => void;
+  onNoMembership: () => void;
+}) {
   useEffect(() => {
-    const handler = () => void onExpired();
-    window.addEventListener('hzm:unauthorized', handler);
-    return () => window.removeEventListener('hzm:unauthorized', handler);
-  }, [onExpired]);
+    const expired = () => void onExpired();
+    const noMembership = () => void onNoMembership();
+
+    window.addEventListener('hzm:unauthorized', expired);
+    window.addEventListener('hzm:no-membership', noMembership);
+    return () => {
+      window.removeEventListener('hzm:unauthorized', expired);
+      window.removeEventListener('hzm:no-membership', noMembership);
+    };
+  }, [onExpired, onNoMembership]);
   return null;
 }
 

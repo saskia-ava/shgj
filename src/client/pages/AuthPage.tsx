@@ -2,12 +2,12 @@ import { useState } from 'react';
 import { api, ApiError } from '../api';
 import { ErrorBanner } from '../App';
 
-type Mode = 'welcome' | 'create' | 'join' | 'login';
+type Mode = 'welcome' | 'register' | 'login' | 'pin-login' | 'join' | 'forgot' | 'codes';
 
 interface LookupMember {
   id: string;
   name: string;
-  hasPin: boolean;
+  claimed: boolean;
 }
 
 export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }) {
@@ -15,29 +15,44 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
-  // 创建房间
-  const [householdName, setHouseholdName] = useState('我们的合租房');
-  const [createName, setCreateName] = useState('');
-  const [createRoom, setCreateRoom] = useState('');
-  const [createPin, setCreatePin] = useState('');
-  const [createPin2, setCreatePin2] = useState('');
+  // 注册 / 登录
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [password2, setPassword2] = useState('');
 
-  // 加入 / 登录
+  // 加入房间
   const [code, setCode] = useState('');
   const [looked, setLooked] = useState<{ name: string; members: LookupMember[] } | null>(null);
   const [joinName, setJoinName] = useState('');
   const [joinRoom, setJoinRoom] = useState('');
+
+  // PIN 快捷登录
   const [pin, setPin] = useState('');
+  const [pinCode, setPinCode] = useState('');
+  const [pinLooked, setPinLooked] = useState<{ name: string; members: LookupMember[] } | null>(null);
   const [pickedMemberId, setPickedMemberId] = useState('');
+
+  // 恢复码展示（注册后一次性）
+  const [codes, setCodes] = useState<string[]>([]);
 
   function reset() {
     setError(null);
+    setEmail('');
+    setPassword('');
+    setPassword2('');
     setCode('');
     setLooked(null);
     setJoinName('');
     setJoinRoom('');
     setPin('');
+    setPinCode('');
+    setPinLooked(null);
     setPickedMemberId('');
+  }
+
+  function go(next: Mode) {
+    reset();
+    setMode(next);
   }
 
   async function run(fn: () => Promise<void>) {
@@ -52,48 +67,96 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
     }
   }
 
-  const handleCreate = () =>
+  const handleRegister = () =>
     run(async () => {
-      if (createPin !== createPin2) {
-        throw new ApiError(0, '两次输入的 PIN 不一致');
-      }
-      await api.createHousehold({
-        householdName: householdName.trim() || '我们的合租房',
-        memberName: createName.trim(),
-        room: createRoom.trim() || undefined,
-        pin: createPin,
-      });
-      await onAuthed();
+      if (password !== password2) throw new ApiError(0, '两次输入的密码不一致');
+      const res = await api.register({ email: email.trim(), password });
+      setCodes(res.recoveryCodes ?? []);
+      setMode('codes');
     });
 
-  const handleLookup = () =>
+  const handleLogin = () =>
     run(async () => {
-      const res = await api.lookupHousehold(code.trim());
-      setLooked({ name: res.household.name, members: res.members });
+      await api.loginWithPassword({ email: email.trim(), password });
+      await onAuthed();
     });
 
   const handleJoin = () =>
     run(async () => {
-      await api.join({
+      if (password !== password2) throw new ApiError(0, '两次输入的密码不一致');
+      const res = await api.join({
         inviteCode: code.trim(),
         name: joinName.trim(),
         room: joinRoom.trim() || undefined,
-        pin,
+        email: email.trim(),
+        password,
       });
+      if (res.recoveryCodes?.length) {
+        setCodes(res.recoveryCodes);
+        setMode('codes');
+        return;
+      }
       await onAuthed();
     });
 
-  const handleClaim = (member: LookupMember) =>
+  const handlePinLookup = () =>
     run(async () => {
-      await api.join({ inviteCode: code.trim(), name: member.name, pin });
+      const res = await api.lookupHousehold(pinCode.trim());
+      setPinLooked({ name: res.household.name, members: res.members });
+    });
+
+  const handlePinLogin = (memberId: string) =>
+    run(async () => {
+      await api.loginWithPin({ inviteCode: pinCode.trim(), memberId, pin });
       await onAuthed();
     });
 
-  const handleLogin = (memberId: string) =>
+  const handleForgot = () =>
     run(async () => {
-      await api.login({ inviteCode: code.trim(), memberId, pin });
-      await onAuthed();
+      if (password !== password2) throw new ApiError(0, '两次输入的新密码不一致');
+      await api.resetWithRecoveryCode({
+        email: email.trim(),
+        code: code.trim(),
+        newPassword: password,
+      });
+      go('login');
     });
+
+  // ── 恢复码（只显示这一次）───────────────────────────────────────
+  if (mode === 'codes') {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <h1 className="auth-title">请保存你的恢复码</h1>
+          <p className="auth-desc">
+            忘记密码时，这是唯一的自助找回方式。**只显示这一次**，关掉就再也看不到了。
+          </p>
+
+          <div className="recovery-codes">
+            {codes.map((c) => (
+              <code key={c} className="recovery-code">
+                {c}
+              </code>
+            ))}
+          </div>
+
+          <div className="alert alert-info">
+            抄在纸上，或存进密码管理器。每个码只能用一次。之后也可以在「室友」页用密码换一批新的。
+          </div>
+
+          <button
+            type="button"
+            className="btn btn-block"
+            onClick={() => {
+              void onAuthed();
+            }}
+          >
+            我已抄好，继续
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // ── 欢迎页 ─────────────────────────────────────────────────────
   if (mode === 'welcome') {
@@ -108,35 +171,30 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
             type="button"
             className="btn btn-block"
             style={{ marginBottom: 10 }}
-            onClick={() => {
-              reset();
-              setMode('create');
-            }}
+            onClick={() => go('register')}
           >
-            创建新房间
+            注册新账号
           </button>
           <button
             type="button"
             className="btn btn-ghost btn-block"
-            onClick={() => {
-              reset();
-              setMode('join');
-            }}
+            style={{ marginBottom: 10 }}
+            onClick={() => go('login')}
           >
-            加入已有房间
+            登录
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost btn-block"
+            onClick={() => go('join')}
+          >
+            用邀请码加入房间
           </button>
 
           <p className="auth-switch" style={{ marginTop: 20 }}>
-            已经是成员了？
-            <button
-              type="button"
-              className="link"
-              onClick={() => {
-                reset();
-                setMode('login');
-              }}
-            >
-              直接登录
+            已经在这个房间设过 PIN？
+            <button type="button" className="link" onClick={() => go('pin-login')}>
+              用 PIN 快速登录
             </button>
           </p>
         </div>
@@ -144,89 +202,236 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
     );
   }
 
-  // ── 创建房间 ───────────────────────────────────────────────────
-  if (mode === 'create') {
+  // ── 注册 ───────────────────────────────────────────────────────
+  if (mode === 'register') {
     return (
       <div className="auth-wrap">
         <div className="auth-card">
-          <h1 className="auth-title">创建新房间</h1>
-          <p className="auth-desc">创建后会生成一个邀请码，发给室友即可加入</p>
+          <h1 className="auth-title">注册</h1>
+          <p className="auth-desc">注册后可以创建自己的房间，或用邀请码加入室友的房间</p>
 
           <ErrorBanner error={error} />
 
           <div className="field">
-            <label htmlFor="hh">房间名称</label>
+            <label htmlFor="re">邮箱</label>
             <input
-              id="hh"
-              value={householdName}
-              onChange={(e) => setHouseholdName(e.target.value)}
-              placeholder="例如：幸福小区 3 栋 502"
-              maxLength={30}
+              id="re"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@example.com"
+              autoComplete="email"
             />
           </div>
 
-          <div className="row">
-            <div className="field">
-              <label htmlFor="mn">你的名字</label>
-              <input
-                id="mn"
-                value={createName}
-                onChange={(e) => setCreateName(e.target.value)}
-                placeholder="例如：小明"
-                maxLength={20}
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="rm">你住的房间（选填）</label>
-              <input
-                id="rm"
-                value={createRoom}
-                onChange={(e) => setCreateRoom(e.target.value)}
-                placeholder="例如：主卧"
-                maxLength={20}
-              />
-            </div>
+          <div className="field">
+            <label htmlFor="rp">密码</label>
+            <input
+              id="rp"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="至少 8 位"
+              autoComplete="new-password"
+            />
           </div>
 
-          <div className="row">
-            <div className="field">
-              <label htmlFor="p1">设置 PIN</label>
-              <input
-                id="p1"
-                type="password"
-                value={createPin}
-                onChange={(e) => setCreatePin(e.target.value)}
-                placeholder="至少 4 位"
-                autoComplete="new-password"
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="p2">再输一次</label>
-              <input
-                id="p2"
-                type="password"
-                value={createPin2}
-                onChange={(e) => setCreatePin2(e.target.value)}
-                autoComplete="new-password"
-              />
-            </div>
+          <div className="field">
+            <label htmlFor="rp2">再输一次</label>
+            <input
+              id="rp2"
+              type="password"
+              value={password2}
+              onChange={(e) => setPassword2(e.target.value)}
+              autoComplete="new-password"
+            />
           </div>
 
-          <div className="alert alert-info">
-            想更安全的话，PIN 可以用一句好记的话（比如「我家猫叫土豆」），
-            比 4 位数字难猜得多。
+          {/* 这一阶段没有域名、发不出验证邮件，所以邮箱只用来登录，
+              任何功能都不以「邮箱已核实」为前提。写清楚免得用户以为要收信。 */}
+          <div className="small faint" style={{ marginBottom: 12 }}>
+            暂时不用邮箱验证，填一个你记得住的就行。邮箱只用于登录。
           </div>
 
           <button
             type="button"
             className="btn btn-block"
-            disabled={busy || !createName.trim() || createPin.length < 4}
-            onClick={handleCreate}
+            disabled={busy || !email.trim() || password.length < 8 || !password2}
+            onClick={handleRegister}
           >
-            {busy ? '创建中…' : '创建房间'}
+            {busy ? '注册中…' : '注册'}
           </button>
           <p className="auth-switch">
-            <button type="button" className="link" onClick={() => setMode('welcome')}>
+            <button type="button" className="link" onClick={() => go('welcome')}>
+              返回
+            </button>
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── 忘记密码 ───────────────────────────────────────────────────
+  if (mode === 'forgot') {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <h1 className="auth-title">用恢复码重置密码</h1>
+
+          <ErrorBanner error={error} />
+
+          <div className="field">
+            <label htmlFor="fe">邮箱</label>
+            <input
+              id="fe"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
+            />
+          </div>
+
+          <div className="field">
+            <label htmlFor="fc">恢复码</label>
+            <input
+              id="fc"
+              className="mono"
+              value={code}
+              onChange={(e) => setCode(e.target.value.toUpperCase())}
+              placeholder="XXXX-XXXX"
+              maxLength={12}
+            />
+          </div>
+
+          <div className="field">
+            <label htmlFor="fp">新密码</label>
+            <input
+              id="fp"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="至少 8 位"
+              autoComplete="new-password"
+            />
+          </div>
+
+          <div className="field">
+            <label htmlFor="fp2">再输一次</label>
+            <input
+              id="fp2"
+              type="password"
+              value={password2}
+              onChange={(e) => setPassword2(e.target.value)}
+              autoComplete="new-password"
+            />
+          </div>
+
+          <div className="alert alert-info">
+            重置成功后所有设备都会退出登录，需要用新密码重新登录。
+          </div>
+
+          <button
+            type="button"
+            className="btn btn-block"
+            disabled={busy || !email.trim() || !code.trim() || password.length < 8}
+            onClick={handleForgot}
+          >
+            {busy ? '重置中…' : '重置密码'}
+          </button>
+          <p className="auth-switch">
+            <button type="button" className="link" onClick={() => go('login')}>
+              返回登录
+            </button>
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  // ── PIN 快捷登录 ───────────────────────────────────────────────
+  if (mode === 'pin-login') {
+    return (
+      <div className="auth-wrap">
+        <div className="auth-card">
+          <h1 className="auth-title">PIN 快捷登录</h1>
+          <p className="auth-desc">输入邀请码，选你的名字，再输 PIN</p>
+
+          <ErrorBanner error={error} />
+
+          <div className="field">
+            <label htmlFor="pc">邀请码</label>
+            <input
+              id="pc"
+              value={pinCode}
+              onChange={(e) => setPinCode(e.target.value.toUpperCase())}
+              placeholder="8 位邀请码"
+              className="mono"
+              maxLength={12}
+              autoCapitalize="characters"
+            />
+          </div>
+
+          {!pinLooked ? (
+            <button
+              type="button"
+              className="btn btn-block"
+              disabled={busy || pinCode.trim().length < 4}
+              onClick={handlePinLookup}
+            >
+              {busy ? '查询中…' : '下一步'}
+            </button>
+          ) : (
+            <>
+              <div className="field">
+                <label>你是谁？</label>
+                <div className="member-grid">
+                  {pinLooked.members
+                    .filter((m) => m.claimed)
+                    .map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        className={`member-chip${pickedMemberId === m.id ? ' on' : ''}`}
+                        onClick={() => setPickedMemberId(m.id)}
+                      >
+                        {m.name}
+                      </button>
+                    ))}
+                </div>
+                {pinLooked.members.filter((m) => m.claimed).length === 0 && (
+                  <div className="small faint" style={{ marginTop: 8 }}>
+                    这个房间里还没有人绑定账号，先用邮箱注册再加入吧。
+                  </div>
+                )}
+              </div>
+
+              {pickedMemberId && (
+                <>
+                  <div className="field">
+                    <label htmlFor="pp">PIN</label>
+                    <input
+                      id="pp"
+                      type="password"
+                      value={pin}
+                      onChange={(e) => setPin(e.target.value)}
+                      autoComplete="current-password"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-block"
+                    disabled={busy || !pin}
+                    onClick={() => handlePinLogin(pickedMemberId)}
+                  >
+                    {busy ? '登录中…' : '登录'}
+                  </button>
+                </>
+              )}
+            </>
+          )}
+
+          <p className="auth-switch">
+            <button type="button" className="link" onClick={() => go('welcome')}>
               返回
             </button>
           </p>
@@ -241,91 +446,46 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
       <div className="auth-wrap">
         <div className="auth-card">
           <h1 className="auth-title">登录</h1>
-          <p className="auth-desc">输入邀请码，选择你的名字</p>
 
           <ErrorBanner error={error} />
 
           <div className="field">
-            <label htmlFor="lc">邀请码</label>
+            <label htmlFor="le">邮箱</label>
             <input
-              id="lc"
-              value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              placeholder="8 位邀请码"
-              className="mono"
-              maxLength={12}
-              autoCapitalize="characters"
+              id="le"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              autoComplete="email"
             />
           </div>
 
-          {!looked ? (
-            <button
-              type="button"
-              className="btn btn-block"
-              disabled={busy || code.trim().length < 4}
-              onClick={handleLookup}
-            >
-              {busy ? '查询中…' : '下一步'}
-            </button>
-          ) : (
-            <>
-              <div className="field">
-                <label>你是谁？</label>
-                <div className="member-grid">
-                  {looked.members
-                    .filter((m) => m.hasPin)
-                    .map((m) => (
-                      <button
-                        key={m.id}
-                        type="button"
-                        className={`member-chip${pickedMemberId === m.id ? ' on' : ''}`}
-                        onClick={() => setPickedMemberId(m.id)}
-                      >
-                        {m.name}
-                      </button>
-                    ))}
-                </div>
-                {looked.members.filter((m) => m.hasPin).length === 0 && (
-                  <div className="small faint" style={{ marginTop: 8 }}>
-                    还没有人设置过 PIN。请改用「加入已有房间」。
-                  </div>
-                )}
-              </div>
+          <div className="field">
+            <label htmlFor="lpw">密码</label>
+            <input
+              id="lpw"
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
+            />
+          </div>
 
-              {pickedMemberId && (
-                <>
-                  <div className="field">
-                    <label htmlFor="lp">PIN</label>
-                    <input
-                      id="lp"
-                      type="password"
-                      value={pin}
-                      onChange={(e) => setPin(e.target.value)}
-                      autoComplete="current-password"
-                    />
-                  </div>
-                  <button
-                    type="button"
-                    className="btn btn-block"
-                    disabled={busy || !pin}
-                    onClick={() => handleLogin(pickedMemberId)}
-                  >
-                    {busy ? '登录中…' : '登录'}
-                  </button>
-                </>
-              )}
-            </>
-          )}
+          <button
+            type="button"
+            className="btn btn-block"
+            disabled={busy || !email.trim() || !password}
+            onClick={handleLogin}
+          >
+            {busy ? '登录中…' : '登录'}
+          </button>
 
           <p className="auth-switch">
-            <button
-              type="button"
-              className="link"
-              onClick={() => {
-                reset();
-                setMode('welcome');
-              }}
-            >
+            <button type="button" className="link" onClick={() => go('forgot')}>
+              忘记密码
+            </button>
+            <span className="faint"> · </span>
+            <button type="button" className="link" onClick={() => go('welcome')}>
               返回
             </button>
           </p>
@@ -334,7 +494,7 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
     );
   }
 
-  // ── 加入房间 ───────────────────────────────────────────────────
+  // ── 用邀请码加入（新用户一步到位）───────────────────────────────
   return (
     <div className="auth-wrap">
       <div className="auth-card">
@@ -361,7 +521,12 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
               type="button"
               className="btn btn-block"
               disabled={busy || code.trim().length < 4}
-              onClick={handleLookup}
+              onClick={() =>
+                run(async () => {
+                  const res = await api.lookupHousehold(code.trim());
+                  setLooked({ name: res.household.name, members: res.members });
+                })
+              }
             >
               {busy ? '查询中…' : '下一步'}
             </button>
@@ -370,36 +535,50 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
           <>
             <div className="alert alert-info">加入「{looked.name}」</div>
 
-            {looked.members.filter((m) => !m.hasPin).length > 0 && (
-              <>
-                <div className="field">
-                  <label>已有你的名字？点一下认领</label>
-                  <div className="member-grid">
-                    {looked.members
-                      .filter((m) => !m.hasPin)
-                      .map((m) => (
-                        <button
-                          key={m.id}
-                          type="button"
-                          className="member-chip"
-                          disabled={pin.length < 4}
-                          title={pin.length < 4 ? '先在下面设置 PIN' : ''}
-                          onClick={() => handleClaim(m)}
-                        >
-                          {m.name}
-                          <span className="chip-sub">认领</span>
-                        </button>
-                      ))}
-                  </div>
-                  <div className="small faint" style={{ marginTop: 6 }}>
-                    先设置下面的 PIN，再点名字认领。
-                  </div>
-                </div>
-                <div className="section-title" style={{ marginTop: 16 }}>
-                  或者以新成员加入
-                </div>
-              </>
+            {looked.members.filter((m) => !m.claimed).length > 0 && (
+              <div className="small faint" style={{ marginBottom: 12 }}>
+                室友已经替你建好了名字？
+                {looked.members
+                  .filter((m) => !m.claimed)
+                  .map((m) => m.name)
+                  .join('、')}
+                ——在下面把「你的名字」填成完全一样，就会自动接上，历史账目不会断。
+              </div>
             )}
+
+            <div className="field">
+              <label htmlFor="je">邮箱</label>
+              <input
+                id="je"
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoComplete="email"
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="jp">密码</label>
+              <input
+                id="jp"
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                placeholder="至少 8 位"
+                autoComplete="new-password"
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="jp2">再输一次</label>
+              <input
+                id="jp2"
+                type="password"
+                value={password2}
+                onChange={(e) => setPassword2(e.target.value)}
+                autoComplete="new-password"
+              />
+            </div>
 
             <div className="row">
               <div className="field">
@@ -422,22 +601,16 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
               </div>
             </div>
 
-            <div className="field">
-              <label htmlFor="jp">设置你的 PIN</label>
-              <input
-                id="jp"
-                type="password"
-                value={pin}
-                onChange={(e) => setPin(e.target.value)}
-                placeholder="至少 4 位"
-                autoComplete="new-password"
-              />
-            </div>
-
             <button
               type="button"
               className="btn btn-block"
-              disabled={busy || !joinName.trim() || pin.length < 4}
+              disabled={
+                busy ||
+                !joinName.trim() ||
+                !email.trim() ||
+                password.length < 8 ||
+                password !== password2
+              }
               onClick={handleJoin}
             >
               {busy ? '加入中…' : '加入房间'}
@@ -446,14 +619,7 @@ export default function AuthPage({ onAuthed }: { onAuthed: () => Promise<void> }
         )}
 
         <p className="auth-switch">
-          <button
-            type="button"
-            className="link"
-            onClick={() => {
-              reset();
-              setMode('welcome');
-            }}
-          >
+          <button type="button" className="link" onClick={() => go('welcome')}>
             返回
           </button>
         </p>

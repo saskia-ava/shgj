@@ -82,6 +82,46 @@ body {
   font-weight: 400;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+/* 房间切换下拉。只在账号有 2 个以上房间时才渲染。
+   刻意做得比标题低调——它是个偶尔用一次的开关，不该跟标题抢注意力。 */
+.household-switch select {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 8px;
+  max-width: 132px;
+  cursor: pointer;
+}
+
+.household-switch select:focus {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+}
+
+/* 只给读屏软件的文本。不要用 display:none —— 那样读屏也读不到，
+   这个标签存在的意义就没了。 */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .tabs {
   max-width: 720px;
   margin: 0 auto;
@@ -631,6 +671,41 @@ button {
   font-size: 11px;
   opacity: 0.75;
   margin-left: 4px;
+}
+
+/* 房间选择页的成员卡片要竖着放（名字 + 房间/身份两行），
+   横排的 chip 塞不下，会挤成一条。 */
+.member-grid .member-chip .chip-sub {
+  display: block;
+  margin-left: 0;
+}
+
+/* ── 恢复码 ───────────────────────────────────────────────────── */
+
+.recovery-codes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 14px 0;
+}
+
+.recovery-code {
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px dashed var(--border);
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 15px;
+  letter-spacing: 0.06em;
+  text-align: center;
+  user-select: all; /* 点一下整条选中，方便复制 */
+}
+
+/* 窄屏上两列会把 XXXX-XXXX 折行，改成单列 */
+@media (max-width: 420px) {
+  .recovery-codes {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* ── 分摊预览 ─────────────────────────────────────────────────── */

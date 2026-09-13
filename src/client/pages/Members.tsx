@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api } from '../api';
 import { ErrorBanner, useApp } from '../App';
 import { fmtDate } from '../format';
+import AccountSecurity from './AccountSecurity';
 
 export default function Members() {
   const { session, members, reloadMembers } = useApp();
@@ -49,11 +50,14 @@ export default function Members() {
       setShowAdd(false);
     })();
 
+  // PIN 现在归「当前房间里的自己」所有，端点不再收成员 id。
+  // 已设过 PIN 就必须带 currentPin——服务端据此判断这是本人在改，
+  // 不是捡到邀请码的人顺手把别人的 PIN 改掉。
   const changePin = () =>
     act(async () => {
-      await api.changePin(session.member.id, {
-        oldPin: me?.hasPin ? oldPin : undefined,
-        newPin,
+      await api.setPin({
+        pin: newPin,
+        ...(me?.hasPin ? { currentPin: oldPin } : {}),
       });
       setOldPin('');
       setNewPin('');
@@ -143,11 +147,13 @@ export default function Members() {
         </div>
       )}
 
-      <div className="section-title">修改我的 PIN</div>
+      <AccountSecurity />
+
+      <div className="section-title">设置 / 修改我的 PIN</div>
       <div className="card">
         {!showPin ? (
           <button type="button" className="btn btn-ghost btn-block" onClick={() => setShowPin(true)}>
-            修改 PIN
+            {me?.hasPin ? '修改 PIN' : '设置 PIN'}
           </button>
         ) : (
           <>
@@ -190,8 +196,11 @@ export default function Members() {
           </>
         )}
         <p className="small faint" style={{ marginTop: 10 }}>
-          出于安全考虑，只有本人能改自己的 PIN——如果允许改别人的，拿到邀请码的人就能直接冒充他人登录，
-          登录的失败锁定也就白做了。代价是忘记 PIN 后无法自助找回。
+          PIN 是**这个房间里**的快捷登录方式：输邀请码 + 选自己的名字 + 输 PIN 就能进，
+          不用打邮箱密码。它绑在「你在这个房间的身份」上，所以换个房间要重新设。
+          <br />
+          忘记 PIN 不会丢账号——用邮箱密码照样能登进来，在这里重设一个就行。
+          PIN 只是快，不是唯一入口。
         </p>
       </div>
 

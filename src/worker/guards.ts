@@ -1,24 +1,68 @@
 import { createMiddleware } from 'hono/factory';
+import type { Context } from 'hono';
 import { lookupSession, readSessionCookie } from './auth';
+import type { SessionRecord } from './auth';
+import { errorBody } from '../shared/errors';
 import type { AppEnv } from './env';
 
-/**
- * 认证中间件：校验 session cookie，把登录态注入上下文。
- * 挂在除 /api/auth/* 以外的所有路由上。
- */
-export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
+/** 读 cookie 并查会话。两个中间件共用。 */
+async function resolveSession(c: Context<AppEnv>): Promise<SessionRecord | null> {
   const token = readSessionCookie(c.req.header('Cookie'));
-  if (!token) {
-    return c.json({ error: '未登录' }, 401);
+  if (!token) return null;
+  return lookupSession(c.env.DB, token);
+}
+
+const SESSION_EXPIRED_MESSAGE = '登录已过期，请重新登录';
+
+/**
+ * 只要求「有一个有效会话」，不要求当前房间里一定有身份。
+ * 用在 /api/auth/* 上——那批接口恰恰要处理「已登录但还没选房间」这个中间态。
+ */
+export const requireSession = createMiddleware<AppEnv>(async (c, next) => {
+  const session = await resolveSession(c);
+  if (!session) {
+    return c.json(errorBody('SESSION_EXPIRED', SESSION_EXPIRED_MESSAGE), 401);
   }
 
-  const session = await lookupSession(c.env.DB, token);
+  c.set('session', session);
+  c.set('accountId', session.accountId);
+  await next();
+});
+
+/**
+ * 认证中间件：校验会话，并确认当前房间下确实有一条在住成员档案，
+ * 然后把登录态注入上下文。
+ *
+ * ⚠️ `memberId` / `householdId` / `memberName` 的**键名和语义刻意保持不变**。
+ *    业务路由里 30 多处 `c.get('householdId')` 全靠它们；这次账号体系重构
+ *    把「成员身份从哪来」彻底换掉了（以前是 sessions.member_id 直接存着，
+ *    现在由 sessions.(account_id, active_household_id) join members 推导），
+ *    但对外的上下文形状一模一样，所以那 6 个业务路由文件**一行都不用改**。
+ *
+ *    如果哪天发现必须去改业务路由才能让新功能工作，那是这里的设计错了，
+ *    应该回来改这里，而不是去改业务路由。
+ *
+ * 成员档案 join 不上时返回 NO_MEMBERSHIP 而不是 401：用户是登录着的，
+ * 回登录页解决不了问题（重登也还是同一个状态），前端应该把他导向房间选择页。
+ */
+export const requireAuth = createMiddleware<AppEnv>(async (c, next) => {
+  const session = await resolveSession(c);
   if (!session) {
-    return c.json({ error: '登录已过期，请重新登录' }, 401);
+    return c.json(errorBody('SESSION_EXPIRED', SESSION_EXPIRED_MESSAGE), 401);
+  }
+
+  c.set('session', session);
+  c.set('accountId', session.accountId);
+
+  if (!session.activeHouseholdId || !session.memberId || session.memberName === null) {
+    return c.json(
+      errorBody('NO_MEMBERSHIP', '你还没有加入任何房间，或已从当前房间退租'),
+      403,
+    );
   }
 
   c.set('memberId', session.memberId);
-  c.set('householdId', session.householdId);
+  c.set('householdId', session.activeHouseholdId);
   c.set('memberName', session.memberName);
 
   await next();

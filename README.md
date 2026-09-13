@@ -2,7 +2,7 @@
 
 给合租室友共用的账本与事务管理工具。四个模块：**账单分摊记账**、**室友与房间管理**、**值日排班**、**公告板 / 公共物品**。
 
-每个室友各自登录，看同一份共享数据。
+每个室友用**邮箱 + 密码**注册后，各自登录、看同一份共享数据。一个账号可以同时属于多个房间，每个房间一套独立的账本，顶部下拉切换。
 
 ## 线上地址
 
@@ -35,8 +35,18 @@ npm run db:local
 echo "PIN_PEPPER=local-dev-pepper-please-change-me" > .dev.vars
 
 npm run dev          # http://localhost:5173
-npm test             # 跑算法与认证单测
+npm test             # 算法与认证单测（77 项）
+
+# 端到端：需要 npm run dev 在另一个终端跑着
+npm run test:e2e     # 注册 / 建房 / 记账 / 多房间切换 / 越权 / 改密码 / PIN（110 项）
+
+# 数据完整性。**迁移之后必跑**，有非零项会以退出码 1 结束
+npm run db:verify:local
 ```
+
+> `test:e2e` 会往本地库写测试数据，并且用固定格式的邮箱。重跑前先重置：
+> `rm -rf .wrangler/state/v3/d1 && npm run db:local`
+> 重置前要先停掉 dev server——它占着 SQLite 文件，Windows 上删不掉。
 
 ## 部署
 
@@ -80,6 +90,84 @@ CI 里的两处特殊处理，改动前请先理解：
 - **测试阈值走环境变量**。`test/auth.test.ts` 里有两条断言本机耗时的金丝雀测试，GitHub 的 runner 比开发机慢，用开发机阈值会误报。CI 里通过 `HZM_CPU_LOCAL_BUDGET_MS: '8'` 放宽。真正防「有人悄悄调高 PBKDF2 轮数」的是那条断言 `PBKDF2_ITERATIONS` 上限的**确定性**测试，与机器快慢无关——放宽计时阈值不影响它的作用。
 - **测试与部署是两个 job，各自构建一次**。看起来重复，但部署必须有自己的构建产物：`.wrangler/deploy/config.json` 是 `.` 开头的隐藏路径，`actions/upload-artifact` 默认会丢弃它，用 artifact 传递反而会漏掉。
 
+## 账号体系与多房间
+
+### 三层身份，缺一不可
+
+这是本项目最容易改错的地方。同一件事在三个不同的层次上有三个不同的东西：
+
+| 层 | 表 | 职责 | 关键约束 |
+|---|---|---|---|
+| **账号** | `accounts` | 邮箱 + 密码。**只有登录凭据，没有任何昵称字段** | 邮箱全局唯一 |
+| **关系** | `members.account_id` | 这个房间里的人属于哪个账号 | 同账号同房间最多一条 `is_active = 1` 的档案 |
+| **凭证** | `member_pins` | 房间级的 PIN 快捷登录 | 主键是 `member_id`，即「账号 × 房间」 |
+
+**为什么账号上不放昵称**：账目、分摊、结算、公告全部按 `members.id` 引用，名字必须是**当时那个名字的历史快照**。账号上挂个昵称，早晚有人拿它去渲染房间内的姓名，改一次昵称两个房间的全部历史账目名字一起漂移。这和「退租必须软删除」是同一族不变量。顺带得到一个隐私属性：你在 A 房叫「小明」、B 房叫「明哥」，两个社交圈无法被一个字符串关联起来。
+
+**`sessions` 存的是 `account_id` + `active_household_id`，不存 `member_id`。** 成员身份每次请求由这两列 LEFT JOIN `members` 推导：
+
+```sql
+SELECT s.account_id, s.active_household_id AS household_id,
+       m.id AS member_id, m.name AS member_name
+  FROM sessions s
+  LEFT JOIN members m
+    ON m.account_id = s.account_id
+   AND m.household_id = s.active_household_id
+   AND m.is_active = 1
+ WHERE s.token = ?
+```
+
+**这个 LEFT JOIN 本身就是授权检查，不只是查询优化。** 把 `active_household_id` 手工改成别人家的房间 id，join 不出成员行 → 403，而不是拿着一个不属于自己的身份去查数据。`npm run test:e2e` 的第 12 节就是直接改库来验证这条防线（fail closed）。
+
+### ⚠️ 任何一个请求最多只做一次 PBKDF2
+
+这是**结构性**约束，不是记性能小抄：
+
+- 单次 6,000 轮 ≈ 2~4ms，两次就把 Workers 免费版 10ms 的 CPU 预算吃光，接口直接 Error 1102
+- 所以**建房 / 加入房间不再顺带设 PIN**——PIN 是建房之后一个独立的可选步骤
+- 所以**改密码拆成两个请求**：`POST /auth/password/verify`（验旧的，1 次）→ 5 分钟内 `POST /auth/password`（算新的，1 次）。合并成一个接口的直觉做法是两次 PBKDF2，直接超限
+- PIN 用 1,000 轮，所以「验旧 PIN + 算新 PIN」这个唯一的两段式路径仍然安全（`test/auth.test.ts` 里有一条断言专门守住它不超过一次密码哈希的成本）
+- **不做「登录成功时静默重算哈希升级轮数」**——它会给每次成功登录加上第二次 PBKDF2，而且只在成功时触发，是最不容易注意到的路径
+
+**客户端预哈希被明确否决**：它要求把 pepper 下发到浏览器，等于扔掉「数据库泄露也爆破不动」这个核心性质。
+
+### 恢复码
+
+这是**第五期（邮件）之前唯一能自助找回密码的途径**。注册时一次性显示 8 个 `XXXX-XXXX`，数据库里只存 SHA-256，之后谁也拿不回来。
+
+- 每个码只能用一次
+- 弄丢了可以在「室友」页底部用密码换一批新的，**旧的立即全部作废**
+- 恢复码只有 40+ bit 熵，够用是因为它只在「知道邮箱」的前提下使用，且失败会走同一套限速
+
+**丢 pepper 是灾难性的**：`PIN_PEPPER` 一旦丢失，所有人既登不上也无法运维重置（密码和 PIN 全部依赖它派生）。本地值在 `.dev.vars`，线上用 `wrangler secret put PIN_PEPPER`，另有一份备份在 `.pin-pepper.backup.txt`（`.gitignore` 里配了 `.pin-pepper*`）。**这三处至少要有两处同时存在。**
+
+## 数据库迁移
+
+用的是 D1 原生迁移（`wrangler d1 migrations`），没有引入 ORM。
+
+```
+npm run db:new "描述"     # 生成 migrations/NNNN_描述.sql
+npm run db:local          # 应用到本地
+npm run db:remote         # 应用到线上
+npm run db:verify         # 应用后核对表/索引/悬空引用，有非零项则退出码 1
+```
+
+### 三条纪律
+
+1. **`0001_init.sql` 之后永不修改。** 它是纯 CREATE，不含任何 DROP，是整条迁移链的基线。
+2. **已应用的迁移文件禁止修改内容。** wrangler 只比对**文件名**，不存校验和。改内容既不重跑也不报错，结果是 commit 里的 schema 和线上库不一致，**且没有任何信号**。要改就新建一个迁移。
+3. **文件里不写任何事务控制语句。** D1 会把整个迁移文件包在一个事务里；写 `BEGIN TRANSACTION;` 会被 wrangler 剥掉，写 `BEGIN;` 不会被剥掉，会被原样发给 D1 在已有事务里再开一个事务然后报错。
+
+### 还有一条，关于 `members.id`
+
+**任何迁移都不得改变 `members.id`。** `expenses.created_by` 和 `chores.member_ids`（JSON 数组）是裸引用，重建 member 行会让它们静默悬空，而 `Σ balance === 0` 这个断言**检查不出来**——余额还是平的，只是挂在了不存在的人身上。`npm run db:verify` 里的 `orphan chores.member_ids` 是唯一能发现它们的办法（`json_each` 是唯一能查 JSON 数组里悬空 id 的手段）。
+
+### ⚠️ D1 的复合 SELECT 上限是 5 项，不是 SQLite 默认的 500
+
+把一堆检查写成一个大 `UNION ALL` 会直接报 `too many terms in compound SELECT`，**整条语句被丢掉，一行结果都出不来**。实测 3/4/5 项通过、6 项开始报错。
+
+所以 `scripts/verify-integrity.sql` 拆成了多条语句，每条的 `UNION ALL` 项数 ≤ 5；表名和索引名那两组改用 `json_each('[...]')` 驱动清单，项数不随检查数量增长。`scripts/verify-integrity.mjs` 会核对总项数（期望 27），项数不对就报错——防止有人日后又把它们合并回去。
+
 ## 两条贯穿全局的约定
 
 **1. 金额一律用整数「分」存储和运算。**
@@ -93,20 +181,38 @@ CI 里的两处特殊处理，改动前请先理解：
 ## 目录结构
 
 ```
+migrations/          D1 迁移（唯一改 schema 的地方，0001_init.sql 是基线）
+scripts/
+├── verify-integrity.sql    完整性检查语句
+├── verify-integrity.mjs    跑上面的 SQL 并断言全为 0
+└── e2e-phase2.mjs          账号体系 / 多房间端到端
 src/
 ├── shared/          前后端共用的纯逻辑（无副作用、无 IO）
 │   ├── money.ts       金额换算、均摊的余数分配
-│   └── balance.ts     ★ 净余额计算 + 最小转账数算法
+│   ├── balance.ts     ★ 净余额计算 + 最小转账数算法
+│   ├── email.ts       邮箱规范化与校验
+│   └── errors.ts      机器可读的错误码（前端据此分流）
 ├── worker/          后端
 │   ├── index.ts       Worker 入口、路由挂载
-│   ├── auth.ts        PIN 哈希、会话、限速
+│   ├── auth.ts        ★ 哈希、会话、限速、恢复码
 │   ├── guards.ts      认证中间件、越权校验
-│   ├── ids.ts         ID 与邀请码生成
+│   ├── ids.ts         ID / 邀请码 / 恢复码生成
 │   └── routes/        各模块接口
 └── client/          前端
+    ├── api.ts         唯一的网络层，也是 Session 类型的定义处
+    └── pages/         各页面；AuthPage 未登录、HouseholdGate 未选房间
 test/                单测
-schema.sql           D1 建表语句
 ```
+
+前端有**三态**，不是两态：
+
+```tsx
+if (!session)                              return <AuthPage />;         // 匿名
+if (!session.household || !session.member) return <HouseholdGate />;   // 登录了，没选房间
+return <AppContext.Provider key={householdId}>…</AppContext.Provider>; // 正常使用
+```
+
+`HouseholdGate` 必须有**三个**出口（选已有 / 建新房 / 用邀请码加入）。只给「选已有房间」的话，用户把唯一的房间退掉之后会看到一张空列表，然后**没有任何办法回到主界面**——连退出登录都要另给一条路。同理，它拿到的 `onLogout` 必须是 App 的 `logout()` 而不是 `reloadSession()`：登出后 `api.me()` 必然 401，`reloadSession` 会静默失败，用户点了退出却还停在原地。
 
 ## 几个容易踩的坑（改动前请先读）
 
@@ -115,9 +221,22 @@ schema.sql           D1 建表语句
 - **`Σ balance === 0` 是硬断言**。一旦不成立说明分摊数据已损坏，代码会抛错而不是静默算错。
 - **每个按 id 操作的接口都要校验 `household_id` 归属**。漏掉就是越权漏洞：任何登录用户都能删别人家的账。
 - **PIN 限速是整个认证方案的前提**。PIN 空间很小，没有失败锁定的话，任何人都能在线穷举完所有 PIN。加盐哈希只防「数据库泄露后的离线爆破」，防不住在线穷举。
+- **认领成员档案必须用条件 UPDATE + 检查 `meta.changes`**，绝不能写成「先 SELECT 再 UPDATE」。两个请求同时认领同一条档案时，后者会顶替前者并**继承对方的余额**。`WHERE account_id IS NULL` 是唯一能挡住这件事的地方。
+- **加入房间时要连「已退租」的旧档案一起找。** 只查在住的话，退租再搬回来会新建一条身份，历史账目留在一条他已经够不着的旧身份上——`Σ balance === 0` 依然成立（退租者仍参与计算），但他自己的欠款在界面上凭空消失。部分唯一索引 `idx_members_account_active` 只约束 `is_active = 1`，正是为了让这条路复用同一条 `members.id`。
+- **同名成员要拦住。** 不拦会静默建出第二个「小红」，账目仍然算得对（成员 id 不同），但 PIN 登录页会让用户在两个一模一样的名字里猜哪个是自己。注意这是「要求加区分」而不是「禁止同名」。
 - **Workers 免费版单请求只有 10ms CPU**，超了会返回 Error 1102。
   **选轮数不能信本机基准**——本机 Node 比 Cloudflare 快约 3 倍：25,000 轮在本机是 3.3ms（看着很安全），线上实测却是 10~14ms，直接超限。现在定在 6,000 轮，线上实测登录接口 5~7ms。
   改轮数前必须先 `npx wrangler tail --format json` 实测 `cpuTime`，别照本机数字拍脑袋。轮数写在哈希串里，改动不会让老哈希失效。
+
+## 已知限制
+
+**多标签页共享同一个 cookie。** 在标签页 A 切到另一个房间，标签页 B 并不知道，会继续往它记忆中的旧房间写数据。
+
+已经做的缓解：切房时 `AppContext.Provider` 上的 `key={householdId}` 会强制整棵子树卸载重建（所有页面的 `useState` 归零，避免「切到 B 房但记账页还预填着 A 房成员」）；标签页重新可见时会重新拉一次 `/me` 对账。
+
+**但这只解决了「切回来的时候能发现」，切过去的瞬间仍可能往错的房间写一两条。** 彻底解决需要跨标签页通信（`BroadcastChannel` + 写操作前校验），成本远大于收益，所以不做，写成已知问题而不是假装不存在。
+
+**`NO_MEMBERSHIP` 不能当成 401 处理。** 它表示「登录着，但当前房间下没有身份」（还没选房间，或已退租）。当成 401 会把人踢回登录页，而**他重登一次会回到完全一样的状态，永远出不来**。前端按错误码分流到「回房间选择页」。
 
 ## 大陆访问
 

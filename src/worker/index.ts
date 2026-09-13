@@ -17,11 +17,16 @@ app.get('/api/health', (c) => c.json({ ok: true, service: 'hezu-life-manager', t
 // CSRF 校验对所有写操作生效，包括未登录就能调用的 /api/auth/*
 app.use('/api/*', csrfGuard);
 
-// 认证路由自身不需要登录态（否则无法登录）
+// 认证路由自己决定哪些端点要登录态（用 requireSession），
+// 因为它们要处理「已登录但还没选房间」这个中间态——那种状态下 requireAuth
+// 会直接 403，而用户恰恰需要在这批接口里把房间选出来。
 app.route('/api/auth', authRoutes);
 
-// 从这里往下都需要有效会话。Hono 的中间件只作用于「注册在其后」的路由，
-// 因此上面那批 /api/auth/* 不受影响。
+// 从这里往下都要求「会话有效 + 当前房间下有在住身份」。Hono 的中间件只作用于
+// 「注册在其后」的路由，因此上面那批 /api/auth/* 不受影响。
+//
+// requireAuth 注入的 memberId / householdId / memberName 三个上下文变量，
+// 键名和语义与重构前完全一致，所以下面 6 个业务路由文件一行都不用改。
 app.use('/api/*', requireAuth);
 
 app.route('/api/members', memberRoutes);
@@ -47,7 +52,7 @@ app.onError((err, c) => {
   if (/no such table/i.test(message)) {
     return c.json(
       {
-        error: '数据库尚未初始化，请先执行建表',
+        error: '数据库尚未初始化，请先执行迁移',
         hint: '本地：npm run db:local　　线上：npm run db:remote',
       },
       500,

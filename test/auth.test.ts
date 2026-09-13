@@ -1,10 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   hashPin,
-  verifyPin,
+  hashPassword,
+  verifySecret,
   timingSafeEqual,
   newSessionToken,
   hashSessionToken,
+  hashRecoveryCode,
+  dummyVerify,
   validatePin,
   isLocked,
   lockRemainingSeconds,
@@ -14,8 +17,10 @@ import {
   MAX_FAILED_ATTEMPTS,
   LOCK_DURATION_MS,
   SESSION_COOKIE,
-  PBKDF2_ITERATIONS,
+  PASSWORD_ITERATIONS,
+  PIN_ITERATIONS,
 } from '../src/worker/auth';
+import { newRecoveryCode, normalizeInviteCode } from '../src/worker/ids';
 
 // 测试跑在 Node 里，但 tsconfig 只挂了 `vite/client` 类型，没有 Node 全局。
 // 这里刻意不引入 @types/node：那样会让 src/worker/ 里的代码也能引用 process、Buffer
@@ -25,17 +30,17 @@ declare const process: { env: Record<string, string | undefined> };
 const PEPPER = 'test-pepper-not-a-real-secret';
 const OTHER_PEPPER = 'a-different-pepper';
 
-describe('hashPin / verifyPin', () => {
+describe('hashPin / verifySecret', () => {
   it('正确 PIN 校验通过', async () => {
     const stored = await hashPin('1234', PEPPER);
-    expect(await verifyPin('1234', stored, PEPPER)).toBe(true);
+    expect(await verifySecret('1234', stored, PEPPER)).toBe(true);
   });
 
   it('错误 PIN 校验失败', async () => {
     const stored = await hashPin('1234', PEPPER);
-    expect(await verifyPin('1235', stored, PEPPER)).toBe(false);
-    expect(await verifyPin('', stored, PEPPER)).toBe(false);
-    expect(await verifyPin('12345', stored, PEPPER)).toBe(false);
+    expect(await verifySecret('1235', stored, PEPPER)).toBe(false);
+    expect(await verifySecret('', stored, PEPPER)).toBe(false);
+    expect(await verifySecret('12345', stored, PEPPER)).toBe(false);
   });
 
   it('相同 PIN 每次哈希都不同（盐生效，防彩虹表）', async () => {
@@ -43,13 +48,13 @@ describe('hashPin / verifyPin', () => {
     const b = await hashPin('1234', PEPPER);
     expect(a).not.toBe(b);
     // 但都能校验通过
-    expect(await verifyPin('1234', a, PEPPER)).toBe(true);
-    expect(await verifyPin('1234', b, PEPPER)).toBe(true);
+    expect(await verifySecret('1234', a, PEPPER)).toBe(true);
+    expect(await verifySecret('1234', b, PEPPER)).toBe(true);
   });
 
   it('★ pepper 不匹配则校验失败——这是数据库泄露后的防线', async () => {
     const stored = await hashPin('1234', PEPPER);
-    expect(await verifyPin('1234', stored, OTHER_PEPPER)).toBe(false);
+    expect(await verifySecret('1234', stored, OTHER_PEPPER)).toBe(false);
   });
 
   it('哈希字符串里不含明文 PIN', async () => {
@@ -60,15 +65,15 @@ describe('hashPin / verifyPin', () => {
 
   it('抗篡改：格式非法的哈希串一律返回 false 而不是抛错', async () => {
     for (const bad of ['', 'garbage', 'pbkdf2-sha256$abc$x$y', 'md5$1$x$y', 'pbkdf2-sha256$0$a$b']) {
-      await expect(verifyPin('1234', bad, PEPPER)).resolves.toBe(false);
+      await expect(verifySecret('1234', bad, PEPPER)).resolves.toBe(false);
     }
   });
 
   it('支持中文与长密码短语', async () => {
     const phrase = '我家猫叫土豆';
     const stored = await hashPin(phrase, PEPPER);
-    expect(await verifyPin(phrase, stored, PEPPER)).toBe(true);
-    expect(await verifyPin('我家猫叫地瓜', stored, PEPPER)).toBe(false);
+    expect(await verifySecret(phrase, stored, PEPPER)).toBe(true);
+    expect(await verifySecret('我家猫叫地瓜', stored, PEPPER)).toBe(false);
   });
 });
 
@@ -84,13 +89,16 @@ describe('单次哈希的 CPU 成本', () => {
   // 计时断言现在只当金丝雀用：机器慢到离谱、或 WebCrypto 出问题时才会响。
   const LOCAL_BUDGET_MS = Number(process.env.HZM_CPU_LOCAL_BUDGET_MS ?? 3.3);
 
-  it('单次哈希的本机耗时在预算内（金丝雀）', async () => {
-    await hashPin('1234', PEPPER); // 预热，避开 JIT 和首次 WebCrypto 初始化的开销
+  it('密码哈希（最贵的那条路径）本机耗时在预算内（金丝雀）', async () => {
+    // ⚠️ 这里必须测 hashPassword 而不是 hashPin。
+    //    密码是 6,000 轮、PIN 只有 1,000 轮，而真正贴着 10ms 上限的是密码路径。
+    //    拿 PIN 去测会得到一条轻松通过、但什么也没保证的测试。
+    await hashPassword('correct horse battery staple', PEPPER); // 预热
 
     const runs: number[] = [];
     for (let i = 0; i < 5; i++) {
       const t0 = performance.now();
-      await hashPin('1234', PEPPER);
+      await hashPassword('correct horse battery staple', PEPPER);
       runs.push(performance.now() - t0);
     }
     const avg = runs.reduce((a, b) => a + b, 0) / runs.length;
@@ -102,7 +110,72 @@ describe('单次哈希的 CPU 成本', () => {
     // 这条是真正防回归的：确定性、不受机器快慢影响。
     // 6,000 轮是线上实测出来的上限（`wrangler tail --format json` 读 cpuTime，
     // 登录接口整体 5~7ms）。改高之前必须先实测，不能只改数字。
-    expect(PBKDF2_ITERATIONS).toBeLessThanOrEqual(6_000);
+    expect(PASSWORD_ITERATIONS).toBeLessThanOrEqual(6_000);
+
+    // PIN 压到 1,000 轮，好让「验旧 PIN + 算新 PIN」这条两段式路径
+    // 加起来仍然落在预算内。真高到和密码一样，改 PIN 就会超限。
+    expect(PIN_ITERATIONS).toBeLessThanOrEqual(1_500);
+  });
+
+  it('★ 唯一的两段式路径（改 PIN）不超过单次密码哈希的成本', () => {
+    // 改 PIN 是全线唯一需要在一个请求里连续做两次哈希的路径（验旧 + 算新）。
+    // 只要它两次加起来不超过一条已经线上实测过的密码路径，就不可能超限。
+    // 密码那条路径之所以不适用这条，是因为它已经被拆成两个请求了。
+    expect(PIN_ITERATIONS * 2).toBeLessThanOrEqual(PASSWORD_ITERATIONS);
+  });
+});
+
+describe('恢复码', () => {
+  it('格式为 XXXX-XXXX，且字符集不含易混字符', () => {
+    for (let i = 0; i < 20; i++) {
+      const code = newRecoveryCode();
+      expect(code).toMatch(/^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+      // 0/O/1/I/L 不在字符集里：恢复码是要用户抄在纸上的
+      expect(code).not.toMatch(/[01OIL]/);
+    }
+  });
+
+  it('每次生成都不同', () => {
+    const set = new Set(Array.from({ length: 200 }, () => newRecoveryCode()));
+    expect(set.size).toBe(200);
+  });
+
+  it('哈希稳定、不可逆，且能容忍用户手抄时的大小写和连字符差异', async () => {
+    const code = newRecoveryCode();
+    const stored = await hashRecoveryCode(normalizeInviteCode(code));
+
+    expect(stored).toHaveLength(64); // SHA-256 hex
+    expect(stored).not.toContain(code);
+
+    // 用户抄成小写、漏掉连字符，归一化后必须是同一个哈希
+    expect(await hashRecoveryCode(normalizeInviteCode(code.toLowerCase()))).toBe(stored);
+    expect(await hashRecoveryCode(normalizeInviteCode(code.replace('-', '')))).toBe(stored);
+    expect(await hashRecoveryCode(normalizeInviteCode(` ${code} `))).toBe(stored);
+  });
+
+  it('不同恢复码哈希不同', async () => {
+    expect(await hashRecoveryCode(normalizeInviteCode(newRecoveryCode()))).not.toBe(
+      await hashRecoveryCode(normalizeInviteCode(newRecoveryCode())),
+    );
+  });
+});
+
+describe('dummyVerify（防账号枚举的时序填充）', () => {
+  it('不抛错，且确实做了一次真实的 PBKDF2', async () => {
+    await expect(dummyVerify(PEPPER)).resolves.toBeUndefined();
+
+    // 与真实校验同量级——否则填充就没意义了，耗时差异照样能被测出来
+    const t0 = performance.now();
+    await dummyVerify(PEPPER);
+    const dummyMs = performance.now() - t0;
+
+    const account = await hashPassword('whatever', PEPPER);
+    const t1 = performance.now();
+    await verifySecret('whatever', account, PEPPER);
+    const realMs = performance.now() - t1;
+
+    // 两者数量级应当接近（放宽到 4 倍，避免在慢机器上抖动误报）
+    expect(dummyMs).toBeLessThan(realMs * 4 + 2);
   });
 });
 

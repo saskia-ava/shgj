@@ -1,10 +1,4 @@
 import { Hono } from 'hono';
-import {
-  clearFailedAttempts,
-  hashPin,
-  validatePin,
-  verifyPin,
-} from '../auth';
 import { newId } from '../ids';
 import { ownedByHousehold } from '../guards';
 import type { AppEnv } from '../env';
@@ -177,59 +171,14 @@ members.post('/:id/restore', async (c) => {
   return c.json({ ok: true });
 });
 
-/**
- * 修改自己的 PIN。
- *
- * 已设置过 PIN 的，必须先提供旧 PIN。
- *
- * ⚠️ 有意不提供「重置他人 PIN」的能力：那会变成一条绕过登录限速的旁路——
- * 拿到邀请码的人只要重置目标的 PIN 就能直接冒充他，而登录接口上那套
- * 失败锁定完全不起作用。代价是忘记 PIN 后无法自助找回，这是已知取舍。
- */
-members.post('/:id/pin', async (c) => {
-  const id = c.req.param('id');
-  const householdId = c.get('householdId');
-
-  if (id !== c.get('memberId')) {
-    return c.json({ error: '只能修改自己的 PIN' }, 403);
-  }
-
-  const pepper = c.env.PIN_PEPPER;
-  if (!pepper || pepper.length < 16) {
-    return c.json({ error: '服务端未配置 PIN_PEPPER 密钥' }, 500);
-  }
-
-  const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>);
-  const newPin = body.newPin;
-  const oldPin = typeof body.oldPin === 'string' ? body.oldPin : '';
-
-  const pinError = validatePin(newPin);
-  if (pinError) return c.json({ error: pinError }, 400);
-
-  const db = c.env.DB;
-  const member = await db
-    .prepare('SELECT pin_hash FROM members WHERE id = ? AND household_id = ?')
-    .bind(id, householdId)
-    .first<{ pin_hash: string | null }>();
-
-  if (!member) return c.json({ error: '成员不存在' }, 404);
-
-  if (member.pin_hash) {
-    if (!oldPin) return c.json({ error: '请输入当前 PIN' }, 400);
-    if (!(await verifyPin(oldPin, member.pin_hash, pepper))) {
-      await db
-        .prepare('UPDATE members SET failed_tries = failed_tries + 1 WHERE id = ?')
-        .bind(id)
-        .run();
-      return c.json({ error: '当前 PIN 不正确' }, 401);
-    }
-  }
-
-  const pinHash = await hashPin(newPin as string, pepper);
-  await db.prepare('UPDATE members SET pin_hash = ? WHERE id = ?').bind(pinHash, id).run();
-  await clearFailedAttempts(db, id);
-
-  return c.json({ ok: true });
-});
+// PIN 的设置/修改已迁到 POST /api/auth/pin。
+//
+// 原来这里是 POST /api/members/:id/pin，有两个问题：
+//   1. 成员 id 出现在 URL 里，等于把一个越权面直接开在路径上（虽然靠
+//      `id !== memberId` 挡住了，但每多一个按 id 操作的端点就多一份风险）
+//   2. 一个请求跑两次 PBKDF2（验旧 PIN + 算新 PIN），贴着 Workers
+//      免费版 10ms CPU 上限，而这条路径从来没被实测过
+//
+// 新端点作用在「当前会话所在房间里的自己」身上，从根上没有 id 可传。
 
 export default members;

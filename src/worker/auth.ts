@@ -26,7 +26,7 @@
  * 改动轮数不会让老哈希失效：轮数写在哈希串里，校验时从串里读。
  */
 
-const PBKDF2_ITERATIONS = 6_000;
+export const PBKDF2_ITERATIONS = 6_000;
 const PBKDF2_HASH = 'pbkdf2-sha256';
 const SALT_BYTES = 16;
 const SESSION_TOKEN_BYTES = 32;

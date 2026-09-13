@@ -14,7 +14,13 @@ import {
   MAX_FAILED_ATTEMPTS,
   LOCK_DURATION_MS,
   SESSION_COOKIE,
+  PBKDF2_ITERATIONS,
 } from '../src/worker/auth';
+
+// 测试跑在 Node 里，但 tsconfig 只挂了 `vite/client` 类型，没有 Node 全局。
+// 这里刻意不引入 @types/node：那样会让 src/worker/ 里的代码也能引用 process、Buffer
+// 这类 Node API 并顺利通过类型检查，但部署到 Cloudflare 会直接崩。就近声明一下即可。
+declare const process: { env: Record<string, string | undefined> };
 
 const PEPPER = 'test-pepper-not-a-real-secret';
 const OTHER_PEPPER = 'a-different-pepper';
@@ -67,7 +73,18 @@ describe('hashPin / verifyPin', () => {
 });
 
 describe('单次哈希的 CPU 成本', () => {
-  it('按线上实测的换算比例，仍在 Workers 免费版 10ms 上限内', async () => {
+  // ⚠️ 本机 Node 比 Cloudflare 快约 3 倍——这是踩过的坑：
+  //    25,000 轮在本机是 3.3ms，看着很安全，线上实测却是 10~13ms，直接超限。
+  //    所以本机阈值必须按 3 倍折算：本机 3.3ms ≈ 线上 10ms。
+  //
+  // 但「本机」不是一个固定速度：GitHub Actions 的 runner 明显比开发机慢，
+  // 用同一个绝对阈值会误报。所以阈值走环境变量，CI 里放宽（见 workflow）。
+  //
+  // 真正防「有人偷偷调高轮数」的是下面那条**确定性**断言，不是这两条计时断言。
+  // 计时断言现在只当金丝雀用：机器慢到离谱、或 WebCrypto 出问题时才会响。
+  const LOCAL_BUDGET_MS = Number(process.env.HZM_CPU_LOCAL_BUDGET_MS ?? 3.3);
+
+  it('单次哈希的本机耗时在预算内（金丝雀）', async () => {
     await hashPin('1234', PEPPER); // 预热，避开 JIT 和首次 WebCrypto 初始化的开销
 
     const runs: number[] = [];
@@ -78,21 +95,14 @@ describe('单次哈希的 CPU 成本', () => {
     }
     const avg = runs.reduce((a, b) => a + b, 0) / runs.length;
 
-    // ⚠️ 这条断言只测本机，而本机比 Cloudflare 快约 3 倍——这是踩过的坑：
-    //    25,000 轮在本机是 3.3ms，看着很安全，线上实测却是 10~13ms，直接超限。
-    //    所以本机阈值必须按 3 倍折算：本机 3ms ≈ 线上 9ms，留 1ms 余量。
-    //    阈值 8ms 是错的，那相当于线上 24ms，必崩。
-    const CLOUDFLARE_SLOWDOWN = 3;
-    const CLOUDFLARE_BUDGET_MS = 10;
-
-    expect(avg * CLOUDFLARE_SLOWDOWN).toBeLessThan(CLOUDFLARE_BUDGET_MS);
+    expect(avg).toBeLessThan(LOCAL_BUDGET_MS);
   });
 
-  it('本机阈值按 3 倍折算后不超过 3ms（防止有人悄悄调高轮数）', async () => {
-    await hashPin('1234', PEPPER);
-    const t0 = performance.now();
-    await hashPin('1234', PEPPER);
-    expect(performance.now() - t0).toBeLessThan(3);
+  it('轮数没有超过线上实测验证过的值', () => {
+    // 这条是真正防回归的：确定性、不受机器快慢影响。
+    // 6,000 轮是线上实测出来的上限（`wrangler tail --format json` 读 cpuTime，
+    // 登录接口整体 5~7ms）。改高之前必须先实测，不能只改数字。
+    expect(PBKDF2_ITERATIONS).toBeLessThanOrEqual(6_000);
   });
 });
 

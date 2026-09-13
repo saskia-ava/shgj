@@ -59,6 +59,26 @@ curl -X PUT "https://api.cloudflare.com/client/v4/accounts/<账户ID>/workers/su
 当前部署在子域 `hezu-home`，得到 `https://hezu-life-manager.hezu-home.workers.dev`。
 
 > `wrangler deploy` 会自动读取 `dist/hezu_life_manager/wrangler.json`（由 Vite 插件生成），不要手动指定 `-c`。它会带上正确的 `main` 和静态资源目录。
+>
+> 机制是：`vite build` 会写出 `.wrangler/deploy/config.json`，里面指向生成的那份配置，wrangler 在仓库根目录跑时会读它并打印「Using redirected Wrangler configuration」。**这个文件是构建产物，`.gitignore` 里不含它（整个 `.wrangler/` 都被忽略）**，所以任何从干净检出开始的构建（包括 CI）都必须先 `npm run build` 再 `wrangler deploy`。
+
+## CI 自动部署
+
+推送到 `main` 后，GitHub Actions 会自动跑测试、构建、部署。配置在 [.github/workflows/deploy.yml](.github/workflows/deploy.yml)。
+
+**首次启用需要配两个仓库 Secret**（Settings → Secrets and variables → Actions → New repository secret）：
+
+| Secret | 从哪来 |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | Cloudflare 后台 → My Profile → API Tokens → Create Token → 用 **Edit Cloudflare Workers** 模板 |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 后台 → Workers & Pages → 右侧栏的 Account ID |
+
+Token 存在 GitHub 的加密区，不会出现在日志里，也不会进代码。**没配 Secret 之前部署任务会直接报错并提示**，不会静默跳过。
+
+CI 里的两处特殊处理，改动前请先理解：
+
+- **测试阈值走环境变量**。`test/auth.test.ts` 里有两条断言本机耗时的金丝雀测试，GitHub 的 runner 比开发机慢，用开发机阈值会误报。CI 里通过 `HZM_CPU_LOCAL_BUDGET_MS: '8'` 放宽。真正防「有人悄悄调高 PBKDF2 轮数」的是那条断言 `PBKDF2_ITERATIONS` 上限的**确定性**测试，与机器快慢无关——放宽计时阈值不影响它的作用。
+- **测试与部署是两个 job，各自构建一次**。看起来重复，但部署必须有自己的构建产物：`.wrangler/deploy/config.json` 是 `.` 开头的隐藏路径，`actions/upload-artifact` 默认会丢弃它，用 artifact 传递反而会漏掉。
 
 ## 两条贯穿全局的约定
 

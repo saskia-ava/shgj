@@ -11,6 +11,8 @@ import { api, ApiError, type ActiveSession, type Member, type Session } from './
 import AuthPage from './pages/AuthPage';
 import HouseholdGate from './pages/HouseholdGate';
 import { CreateHouseholdForm, JoinHouseholdForm } from './pages/HouseholdForms';
+import AvatarMenu from './components/AvatarMenu';
+import { useDismissable } from './components/useDismissable';
 import Dashboard from './pages/Dashboard';
 import Expenses from './pages/Expenses';
 import Balance from './pages/Balance';
@@ -236,44 +238,25 @@ export default function App() {
           <div className="topbar-inner">
             <div style={{ minWidth: 0 }}>
               <h1>{activeSession.household.name}</h1>
-              <div className="topbar-sub">
-                你好，{activeSession.member.name}
-                {activeSession.member.room ? ` · ${activeSession.member.room}` : ''}
-              </div>
-            </div>
-            <div className="topbar-actions">
-              {session.households.length > 1 && (
-                <label className="household-switch">
-                  <span className="sr-only">切换房间</span>
-                  <select
-                    value={activeSession.household.id}
-                    onChange={(e) => void switchHousehold(e.target.value)}
-                  >
-                    {session.households.map((h) => (
-                      <option key={h.id} value={h.id}>
-                        {h.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+              {/* ⚠️ 这里以前是「你好，{名字}」，现在名字挪到了右边的头像菜单上
+                  （头像 + 名字是同一个按钮）。留在这里会一行里出现两次名字。
+                  副标题回到它最该干的事：说明「我」在这个房间里是谁。 */}
+              {activeSession.member.room && (
+                <div className="topbar-sub">{activeSession.member.room}</div>
               )}
-              {/* ⚠️ 这个按钮和上面的下拉框是**互补**的，两个条件不能混：
-                  下拉框只在 `households.length > 1` 时出现（一个房间没什么好切的），
-                  而建第二个房间恰恰要在一个房间的时候才能做。
-                  曾经只有下拉框没有这个按钮，结果是——只有一个房间的账号，
-                  界面上没有任何入口能建/加入第二个房间，只能退出登录重新注册。
-                  服务端一直支持（见 HouseholdForms.tsx 顶部注释）。 */}
-              <button
-                type="button"
-                className="btn btn-ghost btn-sm"
-                onClick={() => setAddRoomOpen(true)}
-              >
-                ＋ 房间
-              </button>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={logout}>
-                退出
-              </button>
             </div>
+            {/* 顶栏的操作全收进了这个头像菜单。
+                ⚠️ 菜单里「切换房间」和「新建 / 加入房间」是**两件事**，别合并：
+                   房间列表只在 households 里有东西时才有意义，而建第二个房间
+                   恰恰要在一个房间的时候做。曾经只有列表没有入口，结果是
+                   只有一个房间的账号没有任何办法再建一个，只能退出重注册。 */}
+            <AvatarMenu
+              session={session}
+              onSwitchHousehold={switchHousehold}
+              onOpenAddRoom={() => setAddRoomOpen(true)}
+              onSessionChanged={reloadSession}
+              onLogout={logout}
+            />
           </div>
 
           <nav className="tabs">
@@ -338,67 +321,25 @@ function AddRoomModal({
   const [mode, setMode] = useState<'create' | 'join'>('create');
   const cardRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    const card = cardRef.current;
-    if (!card) return;
-
-    // 打开时把焦点移进弹窗。不做的话键盘用户按 Tab 会跑到后面那层被遮住的
-    // 页面上，而视觉上完全看不出焦点在哪儿。
-    card.focus();
-
-    const onKey = (e: KeyboardEvent) => {
-      // Esc 关闭。遮罩点击只是补充——键盘用户没有别的办法出去。
-      if (e.key === 'Escape') {
-        onClose();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-
-      // 把焦点锁在弹窗里。
-      // ⚠️ 这不是可选的润色：下面写了 `aria-modal="true"`，那句话断言的是
-      //    「弹窗外面不可交互」。不锁的话这个断言就是假的——屏幕阅读器把
-      //    后面那层读成不可用，键盘却进得去。要么两者都有，要么两者都没有。
-      const nodes = card.querySelectorAll<HTMLElement>(
-        'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
-      );
-      // 过滤掉 disabled 的：建房表单在房间名/名字填完前，提交按钮是禁用的，
-      // 不滤的话「最后一个可聚焦元素」会算到一个根本聚焦不上的按钮上。
-      const focusable = Array.from(nodes).filter((el) => !el.hasAttribute('disabled'));
-      if (focusable.length === 0) return;
-
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      const active = document.activeElement;
-
-      if (e.shiftKey && (active === first || active === card)) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    };
-
-    document.addEventListener('keydown', onKey);
-    return () => document.removeEventListener('keydown', onKey);
-  }, [onClose]);
+  // Esc 关闭、点遮罩关闭、焦点进来且锁住、关掉后还回触发按钮。
+  // `trapFocus: true` 是必须的——下面写了 `aria-modal="true"`，那句话断言
+  // 「弹窗外不可交互」，不锁焦点这个断言就是假的。
+  useDismissable({ ref: cardRef, onClose, trapFocus: true });
 
   return (
-    <div
-      className="modal-backdrop"
-      onClick={onClose}
-      // 点遮罩关闭。里面的卡片必须吃掉冒泡，否则在输入框里按下鼠标、
-      // 拖到卡片外面再松手，也会顺手把弹窗关掉并丢掉填了一半的内容。
-    >
+    // 遮罩的点击**不**绑在这里：useDismissable 用 pointerdown 判断「点在
+    // 浮层外面」，行为完全一样，而且不需要给卡片挂 stopPropagation 去挡冒泡
+    // （那种写法在「输入框里按下鼠标、拖到卡片外松手」时会误关）。
+    <div className="modal-backdrop">
       <div
         ref={cardRef}
         className="modal-card"
         role="dialog"
         aria-modal="true"
         aria-labelledby="add-room-title"
-        // tabIndex={-1} 是为了能 .focus()（上面那个 effect），但不进 Tab 序列。
+        // tabIndex={-1} 是焦点落在卡片上时的兜底（没有可聚焦子元素时用），
+        // 让 .focus() 有地方落，同时不进 Tab 序列。
         tabIndex={-1}
-        onClick={(e) => e.stopPropagation()}
       >
         <div className="modal-head">
           <h2 className="modal-title" id="add-room-title">

@@ -30,7 +30,7 @@ const BASE = process.env.HZM_BASE ?? 'http://localhost:5173/api';
  *   node scripts/e2e-phase2.mjs
  *   HZM_BASE=https://<你的域名>/api node scripts/e2e-phase2.mjs
  *
- * ⚠️ 第 12 节要直接改库。改库那条命令的目标必须跟着 BASE 走——
+ * ⚠️ 第 13 节要直接改库。改库那条命令的目标必须跟着 BASE 走——
  *    写死 `--local` 的话，打线上时 UPDATE 落在了本地库上，
  *    那一节在线上**什么都没验证**，却会全绿通过。
  */
@@ -103,7 +103,7 @@ class Jar {
 }
 
 /**
- * 拿一个 .sql 文件去打数据库（第 12 节用）。
+ * 拿一个 .sql 文件去打数据库（第 13 节用）。
  *
  * 直接用 node 跑 wrangler 的入口脚本，而不是 `npx` / `npx.cmd`：
  * Node 24 起在 Windows 上禁止 spawnSync 直接执行 .cmd（抛 EINVAL），
@@ -506,8 +506,91 @@ section('11. 退租后回到「选房间」页，而不是登录页');
   eq('活跃的「小红」恰好一个', 1, r.body.balances.filter((b) => b.name === '小红' && b.isActive).length);
 }
 
-// ── 12. 篡改数据库（最后一节，用一次性账号，不污染前面的状态）─────
-section('12. 越权：直接改库绕过路由校验（fail closed）');
+// ── 12. 头像 ──────────────────────────────────────────────────────
+//
+// 用一次性账号，理由和下面那节一样：不依赖前面各节留下的会话状态。
+// 第 9 节用恢复码重置密码会**清空所有登录态**，第 11 节又把 B 退租又重新加入，
+// 想在这里复用 A / B 得先把这些副作用全推一遍——很脆，而且一旦哪节改了顺序
+// 这里会跟着坏，且坏得很难看出来。
+section('12. 头像：只能换自己的');
+{
+  const E = new Jar();
+  const eMail = `avatar${stamp}@example.com`;
+
+  const reg = await E.post('/auth/register', { email: eMail, password: PW });
+  eq('注册 201', 201, reg.status);
+  const made = await E.post('/auth/household', { householdName: '头像测试房', memberName: '阿头' });
+  eq('建房 201', 201, made.status);
+  const meId = made.body.member?.id;
+  eq('新账号默认没有头像（用首字母兜底）', null, made.body.member?.avatar);
+
+  // 加一个「别人」当越权测试的靶子。
+  //
+  // ⚠️ 这里**不要**写成 `ok(\`建好了 ${id ? '✓' : '✗'}\`)`——那个 ok() 是
+  //    无条件的，字符串里写「✗ 没找到」它照样报 PASS。第一版就是这么写的，
+  //    于是靶子根本没建出来，后面两条越权断言拿 undefined 去打 404，
+  //    还显示成「一条通过一条失败」，而真正的原因在最上面那一行绿字里。
+  //    凡是能被写成 eq 的，就不要用 ok 加三元表达式。
+  const other = await E.post('/members', { name: '别人' });
+  eq('占位成员创建 201', 201, other.status);
+  const otherId = other.body.member?.id;
+  eq('新成员默认没有头像', null, other.body.member?.avatar);
+
+  // 1) 换自己的
+  const set = await E.patch(`/members/${meId}`, { avatar: 'fox' });
+  eq('换自己的头像 200', 200, set.status);
+  const me1 = await E.get('/auth/me');
+  eq('/me 里读回新头像', 'fox', me1.body.member?.avatar);
+  eq('households 列表里也带头像', 'fox', me1.body.households?.find((h) => h.id === made.body.household?.id)?.avatar);
+
+  // 2) 不在白名单里的值必须被拒，且**不能**把已有的改坏
+  const badValue = await E.patch(`/members/${meId}`, { avatar: 'not-a-real-avatar' });
+  eq('不在白名单里的值被拒 400', 400, badValue.status);
+  const me2 = await E.get('/auth/me');
+  eq('被拒之后头像没有变', 'fox', me2.body.member?.avatar);
+
+  // 3) 换别人的——本节真正要守的一条
+  const cross = await E.patch(`/members/${otherId}`, { avatar: 'tiger' });
+  eq('换别人的头像 403', 403, cross.status);
+  const list1 = await E.get('/members');
+  eq('别人的头像仍然是空的', null, list1.body.members?.find((m) => m.id === otherId)?.avatar);
+
+  // 4) GET /members 本身。
+  //
+  // ⚠️ 这一节是**唯一**碰 GET /members 的地方，而它此前一个断言都没有——
+  //    结果是这个端点从第二期重建起就一直在 500（`pin_hash` 写成了裸列名，
+  //    而那一列早已搬到 member_pins），三周没人发现。所以下面几条要写死，
+  //    尤其 `200` 和「列表非空」：只断言字段存在的话，
+  //    500 时 `body.members` 是 undefined，`(x ?? []).every(...)` 会**空数组
+  //    通过**，绿得毫无意义（第一版就是这么写的）。
+  eq('GET /members 返回 200', 200, list1.status);
+  const all = list1.body.members ?? [];
+  eq('成员列表里有两个身份（阿头 + 别人）', 2, all.length);
+  eq(
+    '成员列表每条都带 avatar 字段',
+    true,
+    all.length > 0 && all.every((m) => 'avatar' in m),
+  );
+  eq('列表里阿头的头像就是刚设的 fox', 'fox', all.find((m) => m.id === meId)?.avatar);
+
+  // hasPin 曾经就是那条 500 的直接原因，单独钉一下：设之前 false，设之后 true。
+  // 只查一次「有 hasPin 字段」是抓不到这条的——字段名对、值全错也能过。
+  eq('还没设 PIN 时 hasPin 为 false', false, all.find((m) => m.id === meId)?.hasPin);
+  await E.post('/auth/pin', { pin: '2468' });
+  const list2 = await E.get('/members');
+  eq('设完 PIN 之后 hasPin 变成 true', true, list2.body.members?.find((m) => m.id === meId)?.hasPin);
+  eq('设 PIN 不影响别人的 hasPin', false, list2.body.members?.find((m) => m.id === otherId)?.hasPin);
+
+  // 5) 清空：null 是合法值，表示回到首字母兜底。
+  //    和「传了非法值」必须分开——非法值上面已经断言是 400。
+  const clear = await E.patch(`/members/${meId}`, { avatar: null });
+  eq('清空头像 200', 200, clear.status);
+  const me3 = await E.get('/auth/me');
+  eq('清空后读回来是 null', null, me3.body.member?.avatar);
+}
+
+// ── 13. 篡改数据库（最后一节，用一次性账号，不污染前面的状态）─────
+section('13. 越权：直接改库绕过路由校验（fail closed）');
 {
   const D = new Jar();
   const D_MAIL = `d${stamp}@example.com`;

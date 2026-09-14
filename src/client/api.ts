@@ -83,6 +83,8 @@ export interface Member {
   name: string;
   room: string | null;
   phone: string | null;
+  /** 预设头像的 id（见 src/shared/avatars.ts）。null = 没设过，用首字母兜底。 */
+  avatar: string | null;
   moveIn: number | null;
   moveOut: number | null;
   isActive: boolean;
@@ -181,12 +183,14 @@ export interface HouseholdSummary {
   memberId: string;
   memberName: string;
   room: string | null;
+  avatar: string | null;
 }
 
 export interface MemberIdentity {
   id: string;
   name: string;
   room: string | null;
+  avatar: string | null;
   phone: string | null;
 }
 
@@ -299,8 +303,19 @@ export const api = {
   addMember: (body: { name: string; room?: string; phone?: string }) =>
     request<{ member: Member }>('/members', { method: 'POST', ...json(body) }),
 
-  updateMember: (id: string, body: Partial<{ name: string; room: string; phone: string }>) =>
-    request<{ ok: boolean }>(`/members/${id}`, { method: 'PATCH', ...json(body) }),
+  updateMember: (
+    id: string,
+    body: Partial<{ name: string; room: string; phone: string; avatar: string | null }>,
+  ) => request<{ ok: boolean }>(`/members/${id}`, { method: 'PATCH', ...json(body) }),
+
+  /**
+   * 换自己的头像。`null` = 清空、回到首字母兜底。
+   *
+   * 服务端只允许改自己的（传别人的 id 会 403），所以这里不做 id 的兜底——
+   * 传错了就应当明确失败，而不是静默地改成「那就改自己的吧」。
+   */
+  setAvatar: (memberId: string, avatar: string | null) =>
+    request<{ ok: boolean }>(`/members/${memberId}`, { method: 'PATCH', ...json({ avatar }) }),
 
   leaveMember: (id: string) => request<{ ok: boolean }>(`/members/${id}/leave`, { method: 'POST' }),
   restoreMember: (id: string) => request<{ ok: boolean }>(`/members/${id}/restore`, { method: 'POST' }),

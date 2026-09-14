@@ -2,8 +2,17 @@ import { useState } from 'react';
 import { api } from '../api';
 import { ErrorBanner, useApp } from '../App';
 import { fmtDate } from '../format';
-import AccountSecurity from './AccountSecurity';
+import Avatar from '../components/Avatar';
 
+/**
+ * 房间里的成员。
+ *
+ * ⚠️ 邀请码、修改密码、设置 PIN 都不在这个页面了——它们挪到了顶栏的
+ *    头像菜单里（点右上角头像 → 对应项）。**不是删掉，是搬家**：
+ *    这几件事原来散在「顶栏 + 室友页底部」两处，找起来要在两个地方翻，
+ *    现在统一在头像菜单一个入口。
+ *    这里留下的都是「这个房间里的人」相关的事：名单、加占位、退租、恢复。
+ */
 export default function Members() {
   const { session, members, reloadMembers } = useApp();
   const [error, setError] = useState<unknown>(null);
@@ -12,13 +21,6 @@ export default function Members() {
   const [name, setName] = useState('');
   const [room, setRoom] = useState('');
   const [phone, setPhone] = useState('');
-
-  // 修改自己的 PIN
-  const [showPin, setShowPin] = useState(false);
-  const [oldPin, setOldPin] = useState('');
-  const [newPin, setNewPin] = useState('');
-
-  const me = members.find((m) => m.id === session.member.id);
 
   // 返回 void 而不是 Promise：这些函数直接挂到 onClick 上，
   // 返回 Promise 既不是合法的点击处理器，也会吞掉异常。
@@ -50,20 +52,6 @@ export default function Members() {
       setShowAdd(false);
     })();
 
-  // PIN 现在归「当前房间里的自己」所有，端点不再收成员 id。
-  // 已设过 PIN 就必须带 currentPin——服务端据此判断这是本人在改，
-  // 不是捡到邀请码的人顺手把别人的 PIN 改掉。
-  const changePin = () =>
-    act(async () => {
-      await api.setPin({
-        pin: newPin,
-        ...(me?.hasPin ? { currentPin: oldPin } : {}),
-      });
-      setOldPin('');
-      setNewPin('');
-      setShowPin(false);
-    })();
-
   const active = members.filter((m) => m.isActive);
   const inactive = members.filter((m) => !m.isActive);
 
@@ -71,18 +59,11 @@ export default function Members() {
     <>
       <ErrorBanner error={error} />
 
-      <div className="card">
-        <div className="invite-box">
-          <div className="invite-hint">把邀请码发给室友，他们就能加入</div>
-          <div className="invite-code">{session.household.inviteCode}</div>
-          <div className="invite-hint">点一下可以选中复制</div>
-        </div>
-      </div>
-
       <div className="section-title">在住（{active.length} 人）</div>
       <div className="card">
         {active.map((m) => (
           <div key={m.id} className="list-item">
+            <Avatar value={m.avatar} name={m.name} size={36} />
             <div className="list-main">
               <div className="list-title">
                 {m.name}
@@ -147,62 +128,9 @@ export default function Members() {
         </div>
       )}
 
-      <AccountSecurity />
-
-      <div className="section-title">设置 / 修改我的 PIN</div>
-      <div className="card">
-        {!showPin ? (
-          <button type="button" className="btn btn-ghost btn-block" onClick={() => setShowPin(true)}>
-            {me?.hasPin ? '修改 PIN' : '设置 PIN'}
-          </button>
-        ) : (
-          <>
-            {me?.hasPin && (
-              <div className="field">
-                <label htmlFor="op">当前 PIN</label>
-                <input
-                  id="op"
-                  type="password"
-                  value={oldPin}
-                  onChange={(e) => setOldPin(e.target.value)}
-                  autoComplete="current-password"
-                />
-              </div>
-            )}
-            <div className="field">
-              <label htmlFor="np">新 PIN</label>
-              <input
-                id="np"
-                type="password"
-                value={newPin}
-                onChange={(e) => setNewPin(e.target.value)}
-                placeholder="至少 4 位"
-                autoComplete="new-password"
-              />
-            </div>
-            <div className="btn-row">
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || newPin.length < 4 || (me?.hasPin && !oldPin)}
-                onClick={changePin}
-              >
-                保存
-              </button>
-              <button type="button" className="btn btn-ghost" onClick={() => setShowPin(false)}>
-                取消
-              </button>
-            </div>
-          </>
-        )}
-        <p className="small faint" style={{ marginTop: 10 }}>
-          PIN 是**这个房间里**的快捷登录方式：输邀请码 + 选自己的名字 + 输 PIN 就能进，
-          不用打邮箱密码。它绑在「你在这个房间的身份」上，所以换个房间要重新设。
-          <br />
-          忘记 PIN 不会丢账号——用邮箱密码照样能登进来，在这里重设一个就行。
-          PIN 只是快，不是唯一入口。
-        </p>
-      </div>
+      <p className="small faint" style={{ textAlign: 'center', marginTop: 16 }}>
+        邀请码、修改密码、设置 PIN 都在右上角的<strong>头像菜单</strong>里。
+      </p>
 
       {inactive.length > 0 && (
         <>
@@ -213,6 +141,7 @@ export default function Members() {
             </p>
             {inactive.map((m) => (
               <div key={m.id} className="list-item">
+                <Avatar value={m.avatar} name={m.name} size={36} className="dim" />
                 <div className="list-main">
                   <div className="list-title strike">{m.name}</div>
                   <div className="list-meta">

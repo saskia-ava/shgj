@@ -58,6 +58,7 @@ interface MembershipRow {
   id: string;
   name: string;
   room: string | null;
+  avatar: string | null;
   household_id: string;
   household_name: string;
   invite_code: string;
@@ -82,7 +83,7 @@ async function buildSessionPayload(
       .first<{ id: string; email: string; email_verified: number }>(),
     db
       .prepare(
-        `SELECT m.id, m.name, m.room, m.household_id,
+        `SELECT m.id, m.name, m.room, m.avatar, m.household_id,
                 h.name AS household_name, h.invite_code, m.created_at
            FROM members m
            JOIN households h ON h.id = m.household_id
@@ -107,11 +108,14 @@ async function buildSessionPayload(
       memberId: m.id,
       memberName: m.name,
       room: m.room,
+      avatar: m.avatar,
     })),
     household: active
       ? { id: active.household_id, name: active.household_name, inviteCode: active.invite_code }
       : null,
-    member: active ? { id: active.id, name: active.name, room: active.room, phone: null } : null,
+    member: active
+      ? { id: active.id, name: active.name, room: active.room, avatar: active.avatar, phone: null }
+      : null,
   };
 }
 

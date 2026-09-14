@@ -82,30 +82,261 @@ body {
   font-weight: 400;
 }
 
-.topbar-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* ── 头像菜单 ─────────────────────────────────────────────────── */
+/*
+ * 顶栏右侧那个「头像 + 名字」按钮，点开是一个下拉面板，里面装着
+ * 更换头像 / 切换房间 / 邀请新室友 / 修改密码 / 设置 PIN / 退出。
+ *
+ * 原来的房间切换下拉（.household-switch）已经并进这个面板，那条规则删了。
+ */
+
+/*
+ * ⚠️ 这个 position: relative 是面板定位的锚点，不能删。
+ *    删掉之后 .avatar-panel 的 absolute 会往上找到别的定位祖先（或视口），
+ *    面板会飞到一个跟按钮无关的地方去。
+ */
+.avatar-menu {
+  position: relative;
   flex-shrink: 0;
 }
 
-/* 房间切换下拉。只在账号有 2 个以上房间时才渲染。
-   刻意做得比标题低调——它是个偶尔用一次的开关，不该跟标题抢注意力。 */
-.household-switch select {
-  font-family: inherit;
-  font-size: 13px;
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 5px 8px;
-  max-width: 132px;
+.avatar-trigger {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 8px 4px 4px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 20px;
   cursor: pointer;
+  font-family: inherit;
+  color: var(--text);
+  transition: background 0.15s, border-color 0.15s;
 }
 
-.household-switch select:focus {
-  outline: 2px solid var(--primary);
-  outline-offset: 1px;
+.avatar-trigger:hover,
+.avatar-trigger.on {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+/* 名字在窄屏上截断，而不是把按钮撑宽——顶栏左边还有房间名要放。 */
+.avatar-trigger-name {
+  font-size: 14px;
+  font-weight: 500;
+  max-width: 88px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.avatar-caret {
+  font-size: 10px;
+  color: var(--text-dim);
+  transition: transform 0.15s;
+}
+
+.avatar-caret.up {
+  transform: rotate(180deg);
+}
+
+/* 圆形头像本体。emoji 和首字母两种来源共用这一套尺寸和形状。 */
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  flex-shrink: 0;
+  line-height: 1;
+  color: #fff;
+  font-weight: 600;
+  user-select: none;
+}
+
+/* 已退租的成员：头像压暗，跟名字的删除线呼应 */
+.avatar.dim {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+.avatar-panel {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 50;
+  width: 280px;
+  max-width: calc(100vw - 32px);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 12px 32px rgba(16, 24, 40, 0.16);
+  overflow: hidden;
+}
+
+/* 面板内容比屏幕高时自己滚，不让整个面板顶出视口 */
+.avatar-panel-body {
+  padding: 12px 14px 14px;
+  max-height: min(70vh, 480px);
+  overflow-y: auto;
+}
+
+.avatar-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px;
+  background: var(--bg);
+}
+
+/* 子面板的头部：返回键 + 居中标题 */
+.avatar-panel-head.bar {
+  justify-content: space-between;
+  padding: 11px 14px;
+}
+
+.avatar-panel-name {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.avatar-panel-mail {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.avatar-panel-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.avatar-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 14px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  color: var(--text);
+  text-align: left;
+}
+
+.avatar-menu-item:hover {
+  background: var(--bg);
+}
+
+.avatar-menu-item.danger {
+  color: #dc2626;
+}
+
+.avatar-menu-icon {
+  width: 20px;
+  text-align: center;
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.avatar-menu-label {
+  flex: 1;
+}
+
+.avatar-menu-value {
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.avatar-menu-arrow {
+  color: var(--text-dim);
+  font-size: 16px;
+  line-height: 1;
+}
+
+.avatar-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 0;
+}
+
+/* 更换头像的九宫格 */
+.avatar-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.avatar-pick {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  border: 2px solid transparent;
+  border-radius: 50%;
+  cursor: pointer;
+  transition: transform 0.12s;
+}
+
+.avatar-pick:hover:not(:disabled) {
+  transform: scale(1.1);
+}
+
+.avatar-pick:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.avatar-pick.on {
+  border-color: var(--primary);
+}
+
+/* 房间列表里的一项：头像 + 房间名 + 我在这个房间里的名字 */
+.avatar-room {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+  color: var(--text);
+}
+
+.avatar-room:hover:not(:disabled) {
+  border-color: var(--primary);
+}
+
+/* 当前房间：标出来并且点不动（点了也没意义，只会闪一下） */
+.avatar-room.on {
+  background: var(--primary-weak);
+  border-color: var(--primary);
+  cursor: default;
+}
+
+.avatar-room-name {
+  display: block;
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 只给读屏软件的文本。不要用 display:none —— 那样读屏也读不到，

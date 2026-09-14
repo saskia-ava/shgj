@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { newId } from '../ids';
 import { ownedByHousehold } from '../guards';
+import { isValidAvatar } from '../../shared/avatars';
 import type { AppEnv } from '../env';
 
 const members = new Hono<AppEnv>();
@@ -9,15 +10,34 @@ function readString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-/** 列表默认包含已退租成员——历史账目要能显示出他们的名字。 */
+/**
+ * 列表默认包含已退租成员——历史账目要能显示出他们的名字。
+ *
+ * ⚠️ `has_pin` 必须走 **LEFT JOIN member_pins**，不能写成裸的
+ *    `(pin_hash IS NOT NULL)`。
+ *
+ *    第二期把 PIN 从 members 挪到了 member_pins，但这条 SELECT 里的
+ *    `pin_hash` 没跟着改——而 members 上已经没有这一列了。于是这条 SQL
+ *    在 D1 上直接报 `no such column: pin_hash`，整个 `GET /members` **500**。
+ *
+ *    这个 bug 从第二期重建（9699a7d）一直活到 2026-09-14 才被发现，原因是
+ *    **没有任何测试覆盖过 GET /members**：E2E 全程用 /auth/me、/balance、
+ *    /expenses，从没调过它；而前端 `reloadMembers()` 是个 `void` 掉的
+ *    promise，500 只会让成员列表静默变空、名字显示成「未知成员」，
+ *    不会白屏也不会报错。所以它看起来「只是有点怪」，而不是「坏了」。
+ *
+ *    教训见 scripts/e2e-phase2.mjs 第 12 节：给这个端点补了断言。
+ */
 members.get('/', async (c) => {
   const { results } = await c.env.DB
     .prepare(
-      `SELECT id, name, room, phone, move_in, move_out, is_active,
-              (pin_hash IS NOT NULL) AS has_pin
-         FROM members
-        WHERE household_id = ?
-        ORDER BY is_active DESC, created_at ASC`,
+      `SELECT m.id, m.name, m.room, m.phone, m.avatar,
+              m.move_in, m.move_out, m.is_active,
+              (p.pin_hash IS NOT NULL) AS has_pin
+         FROM members m
+         LEFT JOIN member_pins p ON p.member_id = m.id
+        WHERE m.household_id = ?
+        ORDER BY m.is_active DESC, m.created_at ASC`,
     )
     .bind(c.get('householdId'))
     .all<{
@@ -25,6 +45,7 @@ members.get('/', async (c) => {
       name: string;
       room: string | null;
       phone: string | null;
+      avatar: string | null;
       move_in: number | null;
       move_out: number | null;
       is_active: number;
@@ -37,6 +58,7 @@ members.get('/', async (c) => {
       name: m.name,
       room: m.room,
       phone: m.phone,
+      avatar: m.avatar,
       moveIn: m.move_in,
       moveOut: m.move_out,
       isActive: m.is_active === 1,
@@ -81,7 +103,11 @@ members.post('/', async (c) => {
     .bind(id, householdId, name, room, phone, now, now)
     .run();
 
-  return c.json({ member: { id, name, room, phone, isActive: true, hasPin: false } }, 201);
+  // ⚠️ 返回体的形状要和 GET /members 里那一条**对齐**（含 avatar）。
+  //    只差一个字段的话，前端哪天改成直接用这个返回值（现在没用）就会
+  //    拿到一个 avatar 是 undefined 的成员，渲染成首字母而不是他设的头像——
+  //    而且只在「刚添加完那一次渲染」出错，看上去像随机 bug。
+  return c.json({ member: { id, name, room, phone, avatar: null, isActive: true, hasPin: false } }, 201);
 });
 
 /** 修改成员资料。 */
@@ -112,6 +138,26 @@ members.patch('/:id', async (c) => {
   if ('phone' in body) {
     fields.push('phone = ?');
     values.push(readString(body.phone) || null);
+  }
+  if ('avatar' in body) {
+    // ⚠️ 头像这一项比其他字段严：**只能改自己的**。
+    //
+    //    这个路由整体是「房间成员可以编辑本房间的成员资料」，名字和房间
+    //    确实有「帮室友维护资料」的正当场景（人还没进来，先替他建好）。
+    //    但头像不一样——它的主张就是「这是我」，替别人挑头像没有任何
+    //    合理场景，只有「给室友挂个丑头像」这一种用法。
+    //
+    //    null 是合法值，表示清空、回到首字母兜底；非法值才报错，
+    //    两者分开，别让「清空」被当成「传了坏数据」。
+    const raw = body.avatar;
+    if (raw !== null && !isValidAvatar(raw)) {
+      return c.json({ error: '头像不在可选范围内' }, 400);
+    }
+    if (id !== c.get('memberId')) {
+      return c.json({ error: '只能换自己的头像' }, 403);
+    }
+    fields.push('avatar = ?');
+    values.push(raw);
   }
 
   if (fields.length === 0) return c.json({ error: '没有需要更新的字段' }, 400);

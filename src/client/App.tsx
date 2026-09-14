@@ -10,6 +10,7 @@ import {
 import { api, ApiError, type ActiveSession, type Member, type Session } from './api';
 import AuthPage from './pages/AuthPage';
 import HouseholdGate from './pages/HouseholdGate';
+import { CreateHouseholdForm, JoinHouseholdForm } from './pages/HouseholdForms';
 import Dashboard from './pages/Dashboard';
 import Expenses from './pages/Expenses';
 import Balance from './pages/Balance';
@@ -60,6 +61,7 @@ export default function App() {
   const [tab, setTab] = useState<TabKey>('dashboard');
   const [restockCount, setRestockCount] = useState(0);
   const [openChoreCount, setOpenChoreCount] = useState(0);
+  const [addRoomOpen, setAddRoomOpen] = useState(false);
 
   const reloadSession = useCallback(async () => {
     const me = await api.me();
@@ -123,6 +125,21 @@ export default function App() {
     const me = await api.switchHousehold(householdId);
     setSession(me);
   }, []);
+
+  const closeAddRoom = useCallback(() => setAddRoomOpen(false), []);
+
+  // 建完 / 加入完房间之后：**先重拉会话，再关弹窗**。
+  //
+  // ⚠️ 两件事的顺序不能换，也不能省掉关闭这一句：
+  //    - `key={householdId}` 只覆盖 Provider 的子树，App 自己没被覆盖，
+  //      所以切房间**不会**把 addRoomOpen 重置回 false。少了这句，用户建完
+  //      房间会看到弹窗还杵在那儿，里面是一张已经提交过的空表单。
+  //    - 反过来先关再拉的话，`api.me()` 万一失败，错误会被渲染到一个已经
+  //      卸载的表单里——用户什么都看不到，只觉得「点了没反应」。
+  const finishAddRoom = useCallback(async () => {
+    await reloadSession();
+    setAddRoomOpen(false);
+  }, [reloadSession]);
 
   // 多标签页共享同一个 cookie：在 A 标签页切了房间，B 标签页并不知道，
   // 会继续往记忆中的旧房间写数据。这里在标签页重新可见时对一次账，
@@ -240,6 +257,19 @@ export default function App() {
                   </select>
                 </label>
               )}
+              {/* ⚠️ 这个按钮和上面的下拉框是**互补**的，两个条件不能混：
+                  下拉框只在 `households.length > 1` 时出现（一个房间没什么好切的），
+                  而建第二个房间恰恰要在一个房间的时候才能做。
+                  曾经只有下拉框没有这个按钮，结果是——只有一个房间的账号，
+                  界面上没有任何入口能建/加入第二个房间，只能退出登录重新注册。
+                  服务端一直支持（见 HouseholdForms.tsx 顶部注释）。 */}
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                onClick={() => setAddRoomOpen(true)}
+              >
+                ＋ 房间
+              </button>
               <button type="button" className="btn btn-ghost btn-sm" onClick={logout}>
                 退出
               </button>
@@ -278,7 +308,138 @@ export default function App() {
           {tab === 'members' && <Members />}
         </main>
       </div>
+
+      {/* 放在 Provider 里、.app 外面：切房间时 key 变化会把它一起重建，
+          弹窗里「新建 / 加入」的选择状态跟着归零，下次打开是干净的。 */}
+      {addRoomOpen && <AddRoomModal onClose={closeAddRoom} onDone={finishAddRoom} />}
     </AppContext.Provider>
+  );
+}
+
+/**
+ * 「＋ 房间」弹窗。
+ *
+ * 这是给**已经有房间**的人准备的第二入口：新建一个房间，或者用邀请码加入
+ * 别人的房间。两种情况下服务端都会把会话的 active_household_id 切到新房间
+ * 并返回新 payload（auth.ts:541 / auth.ts:671），所以提交完直接落进新房间，
+ * 不需要额外来一步「切换」。
+ *
+ * ⚠️ 这个按钮以前不存在，于是「同一个人怎么用第二个房间」在界面上是无解的。
+ *    没做权限判断是**故意**的：多房间一开始就是设计目标（一个房间一个账本），
+ *    服务端也早就按账号可以属于多个房间来建模了，这里只是把入口补上。
+ */
+function AddRoomModal({
+  onClose,
+  onDone,
+}: {
+  onClose: () => void;
+  onDone: () => Promise<void>;
+}) {
+  const [mode, setMode] = useState<'create' | 'join'>('create');
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+
+    // 打开时把焦点移进弹窗。不做的话键盘用户按 Tab 会跑到后面那层被遮住的
+    // 页面上，而视觉上完全看不出焦点在哪儿。
+    card.focus();
+
+    const onKey = (e: KeyboardEvent) => {
+      // Esc 关闭。遮罩点击只是补充——键盘用户没有别的办法出去。
+      if (e.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (e.key !== 'Tab') return;
+
+      // 把焦点锁在弹窗里。
+      // ⚠️ 这不是可选的润色：下面写了 `aria-modal="true"`，那句话断言的是
+      //    「弹窗外面不可交互」。不锁的话这个断言就是假的——屏幕阅读器把
+      //    后面那层读成不可用，键盘却进得去。要么两者都有，要么两者都没有。
+      const nodes = card.querySelectorAll<HTMLElement>(
+        'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
+      );
+      // 过滤掉 disabled 的：建房表单在房间名/名字填完前，提交按钮是禁用的，
+      // 不滤的话「最后一个可聚焦元素」会算到一个根本聚焦不上的按钮上。
+      const focusable = Array.from(nodes).filter((el) => !el.hasAttribute('disabled'));
+      if (focusable.length === 0) return;
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+
+      if (e.shiftKey && (active === first || active === card)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="modal-backdrop"
+      onClick={onClose}
+      // 点遮罩关闭。里面的卡片必须吃掉冒泡，否则在输入框里按下鼠标、
+      // 拖到卡片外面再松手，也会顺手把弹窗关掉并丢掉填了一半的内容。
+    >
+      <div
+        ref={cardRef}
+        className="modal-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="add-room-title"
+        // tabIndex={-1} 是为了能 .focus()（上面那个 effect），但不进 Tab 序列。
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="modal-head">
+          <h2 className="modal-title" id="add-room-title">
+            再开一个房间
+          </h2>
+          <button type="button" className="link faint" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+
+        <p className="auth-desc" style={{ textAlign: 'left', marginBottom: 16 }}>
+          一个房间一个账本。新建或加入之后会自动切过去，之后在顶栏随时切回来。
+        </p>
+
+        {/* 两个表单是**不同类型**的组件，React 在同一个位置遇到类型变化会
+            卸载重建，各自的 useState（名字、邀请码、查到的一半状态）天然
+            互不串台，不需要额外给 key。 */}
+        <div className="segmented" style={{ marginBottom: 18 }}>
+          <button
+            type="button"
+            className={`seg${mode === 'create' ? ' on' : ''}`}
+            onClick={() => setMode('create')}
+          >
+            新建房间
+          </button>
+          <button
+            type="button"
+            className={`seg${mode === 'join' ? ' on' : ''}`}
+            onClick={() => setMode('join')}
+          >
+            用邀请码加入
+          </button>
+        </div>
+
+        {mode === 'create' ? (
+          <CreateHouseholdForm onDone={onDone} />
+        ) : (
+          <JoinHouseholdForm onDone={onDone} />
+        )}
+      </div>
+    </div>
   );
 }
 

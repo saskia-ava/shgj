@@ -290,6 +290,10 @@ let H2, M3;
   ok(`两个房间 id 不同：${H1 !== H2}`);
   eq('第二间房里的名字是明哥', '明哥', r.body.member?.name);
   eq('households 列表有 2 项', 2, r.body.households?.length);
+  // 前端顶栏的「＋ 房间」弹窗依赖这一条：已登录时建房，服务端会顺带把会话的
+  // active_household_id 切到新房间（auth.ts:541）。不切的话弹窗提交完会
+  // 停在原地、看起来像没成功。（见 HouseholdForms.tsx 顶部注释。）
+  eq('开完新房，当前房间就是新房', H2, r.body.household?.id);
   eq('老账号开新房不发恢复码', undefined, r.body.recoveryCodes);
   ok(`两个房间的身份不同：${M1 !== M3}`);
 }

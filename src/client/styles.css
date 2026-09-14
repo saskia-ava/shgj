@@ -605,6 +605,61 @@ button {
   text-decoration: underline;
 }
 
+/* ── 弹窗 ─────────────────────────────────────────────────────── */
+/*
+ * 全站目前唯一的弹窗（顶栏「＋ 房间」）。z-index 必须压过 .topbar 的 20。
+ */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(16, 24, 40, 0.45);
+  display: flex;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+/*
+ * ⚠️ 居中用子元素的 `margin: auto`，**不是** 在 .modal-backdrop 上写
+ *    `align-items: center`。后者在内容比容器高时（小屏 + 弹出的软键盘，
+ *    或者以后往弹窗里加内容）会把**顶部裁掉并且滚不到**——上半部分
+ *    永远看不见，而且看起来像内容根本没渲染出来。
+ *    `margin: auto` 在溢出时会自动退化成从顶部开始，两边都正确。
+ */
+.modal-card {
+  width: 100%;
+  max-width: 400px;
+  margin: auto;
+  background: var(--surface);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 10px 40px rgba(16, 24, 40, 0.25);
+}
+
+/*
+ * 弹窗打开时焦点会落在卡片本身（tabIndex={-1}），不给它描边——卡片不是
+ * 可交互元素，框住整张卡片只会让人以为里面全都能点。
+ * 里面的输入框和按钮照常有自己的焦点样式。
+ */
+.modal-card:focus {
+  outline: none;
+}
+
+.modal-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.modal-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+}
+
 /* ── 邀请码 ───────────────────────────────────────────────────── */
 
 .invite-box {

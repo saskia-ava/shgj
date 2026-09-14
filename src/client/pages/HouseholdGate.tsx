@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { api, type Session } from '../api';
 import { ErrorBanner } from '../App';
+import { CreateHouseholdForm, JoinHouseholdForm } from './HouseholdForms';
 
 type Mode = 'pick' | 'create' | 'join';
 
@@ -16,6 +17,9 @@ type Mode = 'pick' | 'create' | 'join';
  * ⚠️ 三个出口一个都不能少。只给「选已有房间」的话，用户把唯一的房间退掉之后
  *    会看到一张空列表，然后**没有任何办法回到主界面**——连退出登录都没有出路，
  *    因为再注册一个账号也还是这个页面。
+ *
+ * 「建新房间 / 用邀请码加入」两个表单住在 HouseholdForms.tsx 里，因为顶栏的
+ * 「＋ 房间」弹窗要用同一份实现（见那个文件顶部的注释）。
  */
 export default function HouseholdGate({
   session,
@@ -33,26 +37,15 @@ export default function HouseholdGate({
   onLogout: () => Promise<void>;
 }) {
   const [mode, setMode] = useState<Mode>(session.households.length > 0 ? 'pick' : 'create');
+
+  // 只有「选已有房间」这一个分支还需要自己管 busy/error；两个表单各自管自己那份，
+  // 所以切模式时它们的错误会自动跟着组件卸载一起清掉，不会串台。
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
-  const [householdName, setHouseholdName] = useState('');
-  const [memberName, setMemberName] = useState('');
-  const [room, setRoom] = useState('');
-
-  const [code, setCode] = useState('');
-  const [looked, setLooked] = useState<{ name: string; members: { id: string; name: string; claimed: boolean }[] } | null>(null);
-
-  async function run(fn: () => Promise<void>) {
-    setBusy(true);
+  function go(next: Mode) {
     setError(null);
-    try {
-      await fn();
-    } catch (e) {
-      setError(e);
-    } finally {
-      setBusy(false);
-    }
+    setMode(next);
   }
 
   return (
@@ -79,12 +72,18 @@ export default function HouseholdGate({
                   type="button"
                   className="member-chip"
                   disabled={busy}
-                  onClick={() =>
-                    run(async () => {
+                  onClick={async () => {
+                    setBusy(true);
+                    setError(null);
+                    try {
                       await api.switchHousehold(h.id);
                       await onChanged();
-                    })
-                  }
+                    } catch (e) {
+                      setError(e);
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
                 >
                   {h.name}
                   <span className="chip-sub">
@@ -109,63 +108,7 @@ export default function HouseholdGate({
               一个房间一个账本。合租换地方了就再建一个，旧账本留在原房间里。
             </p>
 
-            <ErrorBanner error={error} />
-
-            <div className="field">
-              <label htmlFor="hh">房间名</label>
-              <input
-                id="hh"
-                value={householdName}
-                onChange={(e) => setHouseholdName(e.target.value)}
-                placeholder="例如：望京西园三区 502"
-                maxLength={30}
-              />
-            </div>
-
-            <div className="row">
-              <div className="field">
-                <label htmlFor="hn">你在房间里的名字</label>
-                <input
-                  id="hn"
-                  value={memberName}
-                  onChange={(e) => setMemberName(e.target.value)}
-                  placeholder="例如：小明"
-                  maxLength={20}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="hr">房间（选填）</label>
-                <input
-                  id="hr"
-                  value={room}
-                  onChange={(e) => setRoom(e.target.value)}
-                  placeholder="例如：主卧"
-                  maxLength={20}
-                />
-              </div>
-            </div>
-
-            <div className="small faint" style={{ marginBottom: 12 }}>
-              建好之后会给你一个邀请码，室友用它加入。
-            </div>
-
-            <button
-              type="button"
-              className="btn btn-block"
-              disabled={busy || !householdName.trim() || !memberName.trim()}
-              onClick={() =>
-                run(async () => {
-                  await api.createHousehold({
-                    householdName: householdName.trim(),
-                    memberName: memberName.trim(),
-                    room: room.trim() || undefined,
-                  });
-                  await onChanged();
-                })
-              }
-            >
-              {busy ? '创建中…' : '创建房间'}
-            </button>
+            <CreateHouseholdForm onDone={onChanged} />
           </>
         )}
 
@@ -174,92 +117,7 @@ export default function HouseholdGate({
           <>
             <h1 className="auth-title">加入房间</h1>
 
-            <ErrorBanner error={error} />
-
-            {!looked ? (
-              <>
-                <p className="auth-desc">输入室友给你的邀请码</p>
-                <div className="field">
-                  <label htmlFor="ghc">邀请码</label>
-                  <input
-                    id="ghc"
-                    value={code}
-                    onChange={(e) => setCode(e.target.value.toUpperCase())}
-                    placeholder="8 位邀请码"
-                    className="mono"
-                    maxLength={12}
-                    autoCapitalize="characters"
-                  />
-                </div>
-                <button
-                  type="button"
-                  className="btn btn-block"
-                  disabled={busy || code.trim().length < 4}
-                  onClick={() =>
-                    run(async () => {
-                      const res = await api.lookupHousehold(code.trim());
-                      setLooked({ name: res.household.name, members: res.members });
-                    })
-                  }
-                >
-                  {busy ? '查询中…' : '下一步'}
-                </button>
-              </>
-            ) : (
-              <>
-                <div className="alert alert-info">加入「{looked.name}」</div>
-
-                {looked.members.filter((m) => !m.claimed).length > 0 && (
-                  <div className="small faint" style={{ marginBottom: 12 }}>
-                    室友已经替你建好了名字？
-                    {looked.members
-                      .filter((m) => !m.claimed)
-                      .map((m) => m.name)
-                      .join('、')}
-                    ——把名字填成完全一样，就会接上已有的档案，历史账目不会断。
-                  </div>
-                )}
-
-                <div className="row">
-                  <div className="field">
-                    <label htmlFor="gn">你的名字</label>
-                    <input
-                      id="gn"
-                      value={memberName}
-                      onChange={(e) => setMemberName(e.target.value)}
-                      maxLength={20}
-                    />
-                  </div>
-                  <div className="field">
-                    <label htmlFor="gr">房间（选填）</label>
-                    <input
-                      id="gr"
-                      value={room}
-                      onChange={(e) => setRoom(e.target.value)}
-                      maxLength={20}
-                    />
-                  </div>
-                </div>
-
-                <button
-                  type="button"
-                  className="btn btn-block"
-                  disabled={busy || !memberName.trim()}
-                  onClick={() =>
-                    run(async () => {
-                      await api.join({
-                        inviteCode: code.trim(),
-                        name: memberName.trim(),
-                        room: room.trim() || undefined,
-                      });
-                      await onChanged();
-                    })
-                  }
-                >
-                  {busy ? '加入中…' : '加入房间'}
-                </button>
-              </>
-            )}
+            <JoinHouseholdForm onDone={onChanged} />
           </>
         )}
 
@@ -268,7 +126,7 @@ export default function HouseholdGate({
         <p className="auth-switch" style={{ marginTop: 20 }}>
           {mode !== 'pick' && session.households.length > 0 && (
             <>
-              <button type="button" className="link" onClick={() => { setError(null); setMode('pick'); }}>
+              <button type="button" className="link" onClick={() => go('pick')}>
                 选已有房间
               </button>
               <span className="faint"> · </span>
@@ -276,14 +134,14 @@ export default function HouseholdGate({
           )}
           {mode !== 'create' && (
             <>
-              <button type="button" className="link" onClick={() => { setError(null); setMode('create'); }}>
+              <button type="button" className="link" onClick={() => go('create')}>
                 建新房间
               </button>
               <span className="faint"> · </span>
             </>
           )}
           {mode !== 'join' && (
-            <button type="button" className="link" onClick={() => { setError(null); setMode('join'); }}>
+            <button type="button" className="link" onClick={() => go('join')}>
               用邀请码加入
             </button>
           )}

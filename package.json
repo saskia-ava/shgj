@@ -17,6 +17,9 @@
     "db:new": "wrangler d1 migrations create hezu-db",
     "db:verify": "node scripts/verify-integrity.mjs --remote",
     "db:verify:local": "node scripts/verify-integrity.mjs --local",
+    "cpu:probe": "node scripts/measure-cpu.mjs",
+    "cpu:report": "node scripts/measure-cpu.mjs --report",
+    "cpu:samples": "node scripts/measure-cpu.mjs --samples",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types"
   },

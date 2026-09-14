@@ -9,3 +9,5 @@ dist/
 
 # 生产环境 PIN_PEPPER 备份，绝不入库
 .pin-pepper*
+backup-before-rebuild.sql
+*.backup.sql

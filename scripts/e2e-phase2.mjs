@@ -739,6 +739,119 @@ section('14. 公告：只有作者能改内容，置顶所有人可用');
   await G.del(`/announcements/${gAid}`);
 }
 
+// ── 15. 退租 / 恢复的权限 ────────────────────────────────────────
+//
+// 守的是「退租不区分退谁」：这两个端点原来只校验「这条档案属于本房间」，
+// 也就是**谁都能退谁、谁都能恢复谁**。其中 `restore` 更重——它把 is_active
+// 翻回 1，而中间件正是按 `m.is_active = 1` join 出成员身份的，所以恢复一个人
+// 等于**把他的账号重新放进这个房间**，能看到全部账目。那不是「标记错了可以
+// 撤回」，那是单向的授权操作。
+//
+// ⚠️ 占位例外（`account_id IS NULL`）必须一起钉住，它不是顺手放宽：
+//    占位档案是「先替还没进来的人建好名字」，它根本没有账号，**永远没法退
+//    自己**。一律锁成「只能退自己」的话，一个最终没搬进来的占位档案会永久
+//    卡在在住名单里——没有删除端点，只有退租。所以规则是
+//    「有账号的只能自己动，没账号的谁都能动」。
+//
+// ⚠️ 本节最后一条断言记录的是一个**设计后果**，不是 bug：已认领的成员自己
+//    退租之后，`restore` 对他实际上不可达（别人调是 403，他自己调时已经没有
+//    成员身份、只会拿到 NO_MEMBERSHIP）。唯一的回头路是**用邀请码重新加入**，
+//    它会沿用原来的 members.id（见第 11 节）。所以这条路径必须在这里被钉住，
+//    否则哪天有人把它改坏了，退租就真的变成不可逆的了。
+section('15. 退租 / 恢复只能动自己的身份，占位档案例外');
+{
+  const H = new Jar();
+  const I = new Jar();
+
+  await H.post('/auth/register', { email: `leaveh${stamp}@example.com`, password: PW });
+  const made = await H.post('/auth/household', { householdName: '退租测试房', memberName: '房东' });
+  eq('甲建房 201', 201, made.status);
+  const hMemberId = made.body.member?.id;
+  const invite = made.body.household?.inviteCode;
+
+  await I.post('/auth/register', { email: `leavei${stamp}@example.com`, password: PW });
+  const joined = await I.post('/auth/join', { inviteCode: invite, name: '租客' });
+  eq('乙加入同一房间 201', 201, joined.status);
+  const iMemberId = joined.body.member?.id;
+  eq('甲和乙是两个不同的成员', true, !!iMemberId && iMemberId !== hMemberId);
+
+  const ph = await H.post('/members', { name: '还没搬进来的人' });
+  eq('占位档案创建 201', 201, ph.status);
+  const phId = ph.body.member?.id;
+
+  // 0) 前端画按钮的依据就是这个字段，先把三种身份区分清楚。
+  //    只断言「有 hasAccount 字段」抓不到这条——字段名对、恒为 true 也能过。
+  const list0 = await H.get('/members');
+  eq('GET /members 返回 200', 200, list0.status);
+  const at = (m) => list0.body.members?.find((x) => x.id === m);
+  eq('新建的占位档案 hasAccount 为 false', false, ph.body.member?.hasAccount);
+  eq('已认领的甲 hasAccount 为 true', true, at(hMemberId)?.hasAccount);
+  eq('已认领的乙 hasAccount 为 true', true, at(iMemberId)?.hasAccount);
+  eq('占位档案在列表里 hasAccount 为 false', false, at(phId)?.hasAccount);
+
+  // 1) 越权：动别人的已认领身份 → 三个方向全部 403
+  //
+  // ⚠️ 这三个 403 **必须连文案一起断言**，光看状态码不行。
+  //    把 canManage 短路成 `return true` 实测过：乙退甲真的成功后，甲的会话
+  //    当场失去成员身份，于是后面两条「甲…403」仍然返回 403——只不过原因是
+  //    NO_MEMBERSHIP 而不是「只能退租自己的身份」。**两条断言会因为错误的
+  //    理由通过**，而它们守的恰是这一节的核心。所以下面比的是 error 文案。
+  const crossLeave = await I.post(`/members/${hMemberId}/leave`);
+  eq('乙退甲 403', 403, crossLeave.status);
+  eq('且理由是「只能退租自己的身份」', '只能退租自己的身份', crossLeave.body?.error);
+
+  const crossLeave2 = await H.post(`/members/${iMemberId}/leave`);
+  eq('甲退乙 403', 403, crossLeave2.status);
+  eq('理由同上，不是 NO_MEMBERSHIP', '只能退租自己的身份', crossLeave2.body?.error);
+
+  const crossRestore = await H.post(`/members/${iMemberId}/restore`);
+  eq('甲恢复乙 403', 403, crossRestore.status);
+  eq('恢复用的是另一套话术', '只能恢复自己的身份', crossRestore.body?.error);
+
+  // 拒绝之后必须真的没动到——只看 403 的话，403 之前先写了库也能全绿
+  const list1 = await H.get('/members');
+  eq('被拒之后甲还在住', true, list1.body.members?.find((m) => m.id === hMemberId)?.isActive);
+  eq('被拒之后乙还在住', true, list1.body.members?.find((m) => m.id === iMemberId)?.isActive);
+
+  // 2) 占位例外：没有账号的档案谁都能操作（它自己动不了）
+  eq('甲退占位档案 200', 200, (await H.post(`/members/${phId}/leave`)).status);
+  const list2 = await H.get('/members');
+  eq('占位档案退租后 isActive 为 false', false, list2.body.members?.find((m) => m.id === phId)?.isActive);
+
+  eq('乙也能恢复占位档案 200', 200, (await I.post(`/members/${phId}/restore`)).status);
+  const list3 = await H.get('/members');
+  eq('恢复后占位档案在住', true, list3.body.members?.find((m) => m.id === phId)?.isActive);
+  // 「恢复在住」不等于「认领」：占位档案恢复回来还是占位档案
+  eq('恢复一个人不等于认领它', false, list3.body.members?.find((m) => m.id === phId)?.hasAccount);
+
+  // 3) 自己退自己 → 200（别把本人也挡在外面）
+  eq('乙退自己 200', 200, (await I.post(`/members/${iMemberId}/leave`)).status);
+
+  const me = await I.get('/auth/me');
+  eq('退租后 /auth/me 仍是 200（登录态还在）', 200, me.status);
+  eq('退租后 household 为 null', null, me.body.household);
+  const bal = await I.get('/balance');
+  eq('退租后查余额 403', 403, bal.status);
+  eq('且是 NO_MEMBERSHIP 而不是 SESSION_EXPIRED', 'NO_MEMBERSHIP', bal.body.code);
+
+  // 4) 退租之后 restore 对他不可达。这正是「恢复是授权操作」的代价：
+  //    别人不能替他恢复（下一条），他自己又没有身份去调（上一段）。
+  const helpRestore = await H.post(`/members/${iMemberId}/restore`);
+  eq('甲想替乙恢复 403', 403, helpRestore.status);
+  eq('用的是权限话术，不是 NO_MEMBERSHIP', '只能恢复自己的身份', helpRestore.body?.error);
+  const list4 = await H.get('/members');
+  eq('乙的档案还在（历史账目要挂在这条上，不能删）', true, !!list4.body.members?.find((m) => m.id === iMemberId));
+  eq('只是被标记成已退租', false, list4.body.members?.find((m) => m.id === iMemberId)?.isActive);
+  eq('已退租的档案仍然标着「已认领」', true, list4.body.members?.find((m) => m.id === iMemberId)?.hasAccount);
+
+  // 5) 唯一那条回头路：用邀请码重新加入，沿用原来的 members.id
+  const back = await I.post('/auth/join', { inviteCode: invite, name: '租客' });
+  eq('乙用邀请码重新加入 200', 200, back.status);
+  eq('沿用原档案，不新建身份', iMemberId, back.body.member?.id);
+  const bal2 = await I.get('/balance');
+  eq('回到房间后能正常查余额', 200, bal2.status);
+}
+
 // ── 总结 ──────────────────────────────────────────────────────────
 console.log(`\n${C.b}────────────────────────────────${C.x}`);
 if (failures.length === 0) {

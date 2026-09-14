@@ -33,6 +33,7 @@ members.get('/', async (c) => {
     .prepare(
       `SELECT m.id, m.name, m.room, m.phone, m.avatar,
               m.move_in, m.move_out, m.is_active,
+              (m.account_id IS NOT NULL) AS has_account,
               (p.pin_hash IS NOT NULL) AS has_pin
          FROM members m
          LEFT JOIN member_pins p ON p.member_id = m.id
@@ -49,6 +50,7 @@ members.get('/', async (c) => {
       move_in: number | null;
       move_out: number | null;
       is_active: number;
+      has_account: number;
       has_pin: number;
     }>();
 
@@ -62,6 +64,9 @@ members.get('/', async (c) => {
       moveIn: m.move_in,
       moveOut: m.move_out,
       isActive: m.is_active === 1,
+      // 「有没有被账号认领」。前端靠它决定退租 / 恢复按钮画不画：
+      // 有账号的只有本人能动，占位档案谁都能动（见 canManage 的注释）。
+      hasAccount: m.has_account === 1,
       hasPin: m.has_pin === 1,
     })),
   });
@@ -103,11 +108,17 @@ members.post('/', async (c) => {
     .bind(id, householdId, name, room, phone, now, now)
     .run();
 
-  // ⚠️ 返回体的形状要和 GET /members 里那一条**对齐**（含 avatar）。
+  // ⚠️ 返回体的形状要和 GET /members 里那一条**对齐**（含 avatar、hasAccount）。
   //    只差一个字段的话，前端哪天改成直接用这个返回值（现在没用）就会
   //    拿到一个 avatar 是 undefined 的成员，渲染成首字母而不是他设的头像——
   //    而且只在「刚添加完那一次渲染」出错，看上去像随机 bug。
-  return c.json({ member: { id, name, room, phone, avatar: null, isActive: true, hasPin: false } }, 201);
+  //
+  //    `hasAccount: false` 不是写死的巧合：这个端点建出来的**就是**占位档案，
+  //    认领只能靠对方用邀请码加入（routes/auth.ts 的 /join）。
+  return c.json(
+    { member: { id, name, room, phone, avatar: null, isActive: true, hasAccount: false, hasPin: false } },
+    201,
+  );
 });
 
 /** 修改成员资料。 */
@@ -173,6 +184,44 @@ members.patch('/:id', async (c) => {
 });
 
 /**
+ * 取成员并确认它属于当前房间，顺带带回 `account_id`。
+ *
+ * 没有复用 `ownedByHousehold`：那个只回 `1 AS ok`，而这里还要判断这条
+ * 档案**有没有被认领**（`account_id` 是否为空）才能定权限。一次查询把
+ * 归属和认领状态一起取回来，D1 往返次数和原来一样（这套架构里 CPU 大头
+ * 在 D1，能不加就不加）。
+ */
+async function findMember(
+  db: D1Database,
+  id: string,
+  householdId: string,
+): Promise<{ accountId: string | null } | null> {
+  return db
+    .prepare('SELECT account_id AS accountId FROM members WHERE id = ? AND household_id = ?')
+    .bind(id, householdId)
+    .first<{ accountId: string | null }>();
+}
+
+/**
+ * 退租 / 恢复的权限规则——**只有自己能操作自己的身份**，外加一条占位例外。
+ *
+ * 为什么要管这件事：这两个端点原来只校验「这条档案属于本房间」，
+ * 也就是**谁都能退谁、谁都能恢复谁**。其中 `restore` 更重——它会把
+ * `is_active` 翻回 1，而中间件正是按 `m.is_active = 1` join 出成员身份的，
+ * 所以恢复一个人等于**把他的账号重新放进这个房间**，能看全部账目。
+ * 那不是「标记错了可以撤回」，那是单向的授权操作。
+ *
+ * ⚠️ **占位档案（`account_id IS NULL`）必须例外，否则会造出一个死胡同。**
+ *    占位档案是「先替还没进来的人建好名字」用的，它根本没有账号，
+ *    **永远没法退自己**。一律锁成「只能退自己」的话，一个最终没搬进来
+ *    的占位档案就永久卡在「在住」名单里——没有删除端点，只有退租。
+ *    所以规则是「有账号的只能自己动，没账号的谁都能动」。
+ */
+function canManage(target: { accountId: string | null }, memberId: string, id: string): boolean {
+  return id === memberId || target.accountId === null;
+}
+
+/**
  * 标记退租（软删除）。
  *
  * 不删行：他参与过的历史账目、分摊明细必须还能显示出名字，
@@ -181,10 +230,15 @@ members.patch('/:id', async (c) => {
 members.post('/:id/leave', async (c) => {
   const id = c.req.param('id');
   const householdId = c.get('householdId');
+  const memberId = c.get('memberId');
   const db = c.env.DB;
 
-  if (!(await ownedByHousehold(db, 'members', id, householdId))) {
+  const target = await findMember(db, id, householdId);
+  if (!target) {
     return c.json({ error: '成员不存在' }, 404);
+  }
+  if (!canManage(target, memberId, id)) {
+    return c.json({ error: '只能退租自己的身份' }, 403);
   }
 
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>);
@@ -199,14 +253,23 @@ members.post('/:id/leave', async (c) => {
   return c.json({ ok: true });
 });
 
-/** 恢复在住状态（退租标记错了可以撤回）。 */
+/**
+ * 恢复在住状态（退租标记错了可以撤回）。
+ *
+ * 权限和 `leave` 完全一致，别以为这里可以松：它才是授予访问权的那一头。
+ */
 members.post('/:id/restore', async (c) => {
   const id = c.req.param('id');
   const householdId = c.get('householdId');
+  const memberId = c.get('memberId');
   const db = c.env.DB;
 
-  if (!(await ownedByHousehold(db, 'members', id, householdId))) {
+  const target = await findMember(db, id, householdId);
+  if (!target) {
     return c.json({ error: '成员不存在' }, 404);
+  }
+  if (!canManage(target, memberId, id)) {
+    return c.json({ error: '只能恢复自己的身份' }, 403);
   }
 
   await db

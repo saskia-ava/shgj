@@ -96,6 +96,13 @@ export default function HouseholdGate({
 
             <div className="alert alert-info">
               你当前没有正在使用的房间。选一个进去，或者新建 / 加入一个。
+              {/* ⚠️ 这一段是「退租只能退自己」的必然结果，不是可选的提示文案。
+                  已认领的成员一旦自己退租，那条档案就只认他自己、别人替他恢复
+                  会 403（恢复等于把账号放回房间，是授权操作），而他自己此时已经
+                  没有成员身份、调 /restore 只会拿到 NO_MEMBERSHIP——所以这张
+                  列表里**不会**出现他刚退掉的那个房间，`restore` 对已认领成员
+                  实际不可达。没有这句话，退租看上去就是不可逆的。 */}
+              之前退租过的房间不会出现在这里，用<strong>邀请码重新加入</strong>就能接回原来的身份。
             </div>
           </>
         )}
@@ -116,6 +123,9 @@ export default function HouseholdGate({
         {mode === 'join' && (
           <>
             <h1 className="auth-title">加入房间</h1>
+            <p className="auth-desc">
+              之前从某个房间退租过也能用邀请码重新加入——原来的身份和全部历史账目都会接回来。
+            </p>
 
             <JoinHouseholdForm onDone={onChanged} />
           </>
@@ -146,6 +156,15 @@ export default function HouseholdGate({
             </button>
           )}
         </p>
+
+        {/* 一个房间都不剩的时候，默认落在「建新房间」上——但那未必是他想要的：
+            把唯一的房间退掉的人想的是回到原来那个，而那张列表里已经没有它了。
+            这一行把他引到唯一能回去的出口。 */}
+        {session.households.length === 0 && mode !== 'join' && (
+          <p className="small faint" style={{ textAlign: 'center', marginTop: 0 }}>
+            刚从某个房间退租？用「用邀请码加入」把原来的身份接回来，历史账目还在。
+          </p>
+        )}
 
         <p className="auth-switch">
           <button type="button" className="link faint" onClick={() => void onLogout()}>

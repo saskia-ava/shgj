@@ -88,6 +88,14 @@ export interface Member {
   moveIn: number | null;
   moveOut: number | null;
   isActive: boolean;
+  /**
+   * 这条档案有没有被账号认领。
+   *
+   * false = 占位档案，还没人用邀请码认领过它。退租 / 恢复按钮的显示条件
+   * 依赖它：**有账号的只有本人能操作，占位档案谁都能操作**——占位档案
+   * 没有账号，永远没法退自己，锁死的话它会永久卡在在住名单里。
+   */
+  hasAccount: boolean;
   hasPin: boolean;
 }
 

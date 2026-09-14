@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { api } from '../api';
+import { api, type Member } from '../api';
 import { ErrorBanner, useApp } from '../App';
 import { fmtDate } from '../format';
 import Avatar from '../components/Avatar';
@@ -55,6 +55,17 @@ export default function Members() {
   const active = members.filter((m) => m.isActive);
   const inactive = members.filter((m) => !m.isActive);
 
+  /**
+   * 退租 / 恢复按钮画不画，和后端 `canManage` 是同一条规则：
+   * **自己的身份，或者还没被认领的占位档案。**
+   *
+   * 占位档案要放行，是因为它没有账号、**永远没法退自己**——锁成一律
+   * 「只能退自己」的话，一个最终没搬进来的占位档案会永久卡在在住名单里
+   * （没有删除端点，只有退租）。消息服务端也会照着这条放行，前端只是
+   * 不让按钮白出现。
+   */
+  const canManage = (m: Member) => m.id === session.member.id || !m.hasAccount;
+
   return (
     <>
       <ErrorBanner error={error} />
@@ -72,21 +83,32 @@ export default function Members() {
                     我
                   </span>
                 )}
+                {!m.hasAccount && (
+                  <span className="tag" style={{ marginLeft: 6 }}>
+                    未认领
+                  </span>
+                )}
               </div>
               <div className="list-meta">
                 {[m.room, m.phone].filter(Boolean).join(' · ') || '未填写房间和联系方式'}
-                {!m.hasPin && ' · 还没设置 PIN'}
+                {/* 占位档案没有账号，「没设 PIN」是必然的，说了等于没说；
+                    这里提示它等人认领更有用。 */}
+                {m.hasAccount
+                  ? !m.hasPin && ' · 还没设置 PIN'
+                  : ' · 等他本人用邀请码加入时认领'}
               </div>
             </div>
-            <button
-              type="button"
-              className="btn btn-ghost btn-sm"
-              disabled={busy}
-              onClick={act(() => api.leaveMember(m.id))}
-              title="标记为已退租"
-            >
-              退租
-            </button>
+            {canManage(m) && (
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm"
+                disabled={busy}
+                onClick={act(() => api.leaveMember(m.id))}
+                title={m.id === session.member.id ? '把自己标记为已退租' : '把这条占位档案标记为已退租'}
+              >
+                退租
+              </button>
+            )}
           </div>
         ))}
       </div>
@@ -130,6 +152,9 @@ export default function Members() {
 
       <p className="small faint" style={{ textAlign: 'center', marginTop: 16 }}>
         邀请码、修改密码、设置 PIN 都在右上角的<strong>头像菜单</strong>里。
+        <br />
+        退租和恢复只能操作<strong>自己的身份</strong>；标着「未认领」的占位档案谁都
+        可以退，因为它还没有账号、自己操作不了。
       </p>
 
       {inactive.length > 0 && (
@@ -143,20 +168,32 @@ export default function Members() {
               <div key={m.id} className="list-item">
                 <Avatar value={m.avatar} name={m.name} size={36} className="dim" />
                 <div className="list-main">
-                  <div className="list-title strike">{m.name}</div>
+                  <div className="list-title strike">
+                    {m.name}
+                    {!m.hasAccount && (
+                      <span className="tag" style={{ marginLeft: 6 }}>
+                        未认领
+                      </span>
+                    )}
+                  </div>
                   <div className="list-meta">
                     {m.room ? `${m.room} · ` : ''}
                     {m.moveOut ? `${fmtDate(m.moveOut)} 退租` : '已退租'}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  className="btn btn-ghost btn-sm"
-                  disabled={busy}
-                  onClick={act(() => api.restoreMember(m.id))}
-                >
-                  恢复在住
-                </button>
+                {/* 恢复在住比退租更要紧——它会把 is_active 翻回 1，等于把
+                    那个账号重新放进这个房间、能看全部账目。所以显示条件
+                    和退租完全一致，不因为是「撤回操作」就放松。 */}
+                {canManage(m) && (
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    disabled={busy}
+                    onClick={act(() => api.restoreMember(m.id))}
+                  >
+                    恢复在住
+                  </button>
+                )}
               </div>
             ))}
           </div>

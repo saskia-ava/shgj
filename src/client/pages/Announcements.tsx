@@ -199,6 +199,10 @@ export default function Announcements() {
                 <p className="ann-body">{a.content}</p>
 
                 <div className="btn-row">
+                  {/* 置顶对**所有人**开放，这是刻意的：它改的是「这条排多前」，
+                      不是内容本身。后端按同一个分界校验（PATCH 里只对
+                      title / content 查作者），所以这颗按钮谁点都不会吃 403。
+                      改这里之前先去看 routes/announcements.ts 那段注释。 */}
                   <button
                     type="button"
                     className="btn btn-ghost btn-sm"
@@ -207,7 +211,8 @@ export default function Announcements() {
                   >
                     {a.isPinned ? '取消置顶' : '置顶'}
                   </button>
-                  {/* 只有作者能改自己的公告——别人发的东西被我改掉会说不清 */}
+                  {/* 只有作者能改自己的公告——别人发的东西被我改掉会说不清。
+                      这条后端也校验（403），前端这里只是不让按钮白出现。 */}
                   {a.authorId === session.member.id && (
                     <button
                       type="button"

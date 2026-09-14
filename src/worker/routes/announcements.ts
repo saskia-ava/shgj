@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { newId } from '../ids';
-import { ownedByHousehold } from '../guards';
 import type { AppEnv } from '../env';
 
 const announcements = new Hono<AppEnv>();
@@ -90,16 +89,53 @@ announcements.post('/', async (c) => {
   );
 });
 
+/**
+ * 取公告并确认它属于当前房间，顺带带回作者。
+ *
+ * 没有复用 `ownedByHousehold`：那个只回一个 `1 AS ok`，这里还要拿 author_id
+ * 跟当前成员比对，而**多跑一次 SELECT 就是多一次 D1 往返**（这套架构里
+ * CPU 大头在 D1，不在 PBKDF2）。一次查询把归属和作者一起取回来更划算。
+ */
+async function findAnnouncement(
+  db: D1Database,
+  id: string,
+  householdId: string,
+): Promise<{ authorId: string } | null> {
+  return db
+    .prepare('SELECT author_id AS authorId FROM announcements WHERE id = ? AND household_id = ?')
+    .bind(id, householdId)
+    .first<{ authorId: string }>();
+}
+
+/** 改别人的公告时统一的拒绝话术。 */
+const NOT_AUTHOR_EDIT = '只有作者能改自己的公告';
+const NOT_AUTHOR_DELETE = '只有作者能删自己的公告';
+
 announcements.patch('/:id', async (c) => {
   const id = c.req.param('id');
   const householdId = c.get('householdId');
+  const memberId = c.get('memberId');
   const db = c.env.DB;
 
-  if (!(await ownedByHousehold(db, 'announcements', id, householdId))) {
+  const existing = await findAnnouncement(db, id, householdId);
+  if (!existing) {
     return c.json({ error: '公告不存在' }, 404);
   }
 
   const body = await c.req.json<Record<string, unknown>>().catch(() => ({}) as Record<string, unknown>);
+
+  // ⚠️ 校验必须**按字段**做，不能加在整个 PATCH 上。
+  //
+  //    「编辑标题/内容」和「置顶」是两种不同的操作，前端的渲染条件也不一样：
+  //    置顶按钮对**所有人**渲染（见 Announcements.tsx），编辑按钮只对作者。
+  //    所以如果在这里写一句 `if (authorId !== memberId) return 403`，
+  //    就会把置顶一起锁掉——而那颗按钮对每个人都是可见的，非作者一点就吃
+  //    403，看起来像按钮坏了。
+  //
+  //    分界线：**动内容的是作者的，改展示位置的（置顶）是全房间的。**
+  if (('title' in body || 'content' in body) && existing.authorId !== memberId) {
+    return c.json({ error: NOT_AUTHOR_EDIT }, 403);
+  }
 
   const fields: string[] = [];
   const values: unknown[] = [];
@@ -134,13 +170,24 @@ announcements.patch('/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+/**
+ * 删除。和改内容一样只认作者。
+ *
+ * 删除比编辑更不可逆（没有「恢复」），所以这里**没有**为了让位给
+ * 「作者退租了怎么办」而放宽——见下面那段注释。
+ */
 announcements.delete('/:id', async (c) => {
   const id = c.req.param('id');
   const householdId = c.get('householdId');
+  const memberId = c.get('memberId');
   const db = c.env.DB;
 
-  if (!(await ownedByHousehold(db, 'announcements', id, householdId))) {
+  const existing = await findAnnouncement(db, id, householdId);
+  if (!existing) {
     return c.json({ error: '公告不存在' }, 404);
+  }
+  if (existing.authorId !== memberId) {
+    return c.json({ error: NOT_AUTHOR_DELETE }, 403);
   }
 
   await db

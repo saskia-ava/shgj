@@ -589,7 +589,7 @@ section('12. 头像：只能换自己的');
   eq('清空后读回来是 null', null, me3.body.member?.avatar);
 }
 
-// ── 13. 篡改数据库（最后一节，用一次性账号，不污染前面的状态）─────
+// ── 13. 篡改数据库（用一次性账号，不污染前面的状态）───────────────
 section('13. 越权：直接改库绕过路由校验（fail closed）');
 {
   const D = new Jar();
@@ -647,6 +647,96 @@ section('13. 越权：直接改库绕过路由校验（fail closed）');
   // 而不是「403 了所以看起来对」。
   const after = await D.get('/balance');
   eq('还原后 D 又能正常访问自己的房间', 200, after.status);
+}
+
+// ── 14. 公告的作者权限 ───────────────────────────────────────────
+//
+// 这一节守的是一条**前后端不一致**：前端把「编辑 / 删除」按钮只画给作者，
+// 后端却只校验房间归属，于是任何房间成员直接调 API 就能改删别人的公告——
+// 界面表达的那条规则在后端并不存在。
+//
+// ⚠️ 关键分界线是**内容 vs 展示位置**，不是「整个 PATCH 一视同仁」：
+//    - title / content  → 只有作者（改的是别人写的话）
+//    - isPinned         → 所有人（改的是「这条排多前」，前端也把按钮画给所有人）
+//    所以下面**必须**有一条「乙置顶甲的公告 → 200」。如果哪天有人把作者校验
+//    加到了整个 PATCH 上，那条会挂，而它挂正是对的——否则前端那颗对所有人
+//    可见的置顶按钮会开始吃 403。
+section('14. 公告：只有作者能改内容，置顶所有人可用');
+{
+  const F = new Jar();
+  const G = new Jar();
+
+  const regF = await F.post('/auth/register', { email: `annf${stamp}@example.com`, password: PW });
+  eq('甲注册 201', 201, regF.status);
+  const made = await F.post('/auth/household', { householdName: '公告测试房', memberName: '甲' });
+  eq('甲建房 201', 201, made.status);
+  const fMemberId = made.body.member?.id;
+
+  const regG = await G.post('/auth/register', { email: `anng${stamp}@example.com`, password: PW });
+  eq('乙注册 201', 201, regG.status);
+  const joined = await G.post('/auth/join', {
+    inviteCode: made.body.household?.inviteCode,
+    name: '乙',
+  });
+  eq('乙加入同一房间 201', 201, joined.status);
+  const gMemberId = joined.body.member?.id;
+  eq('甲和乙是两个不同的成员', true, !!gMemberId && gMemberId !== fMemberId);
+
+  const post = await F.post('/announcements', { title: '周六保洁', content: '上午十点来打扫' });
+  eq('甲发公告 201', 201, post.status);
+  const aid = post.body.announcement?.id;
+  eq('返回的作者是甲', fMemberId, post.body.announcement?.authorId);
+
+  // 1) 乙改甲的内容 → 403
+  const gEditTitle = await G.patch(`/announcements/${aid}`, { title: '周六保洁（乙改的）' });
+  eq('乙改别人的标题 403', 403, gEditTitle.status);
+  const gEditBody = await G.patch(`/announcements/${aid}`, { content: '乙改的内容' });
+  eq('乙改别人的内容 403', 403, gEditBody.status);
+
+  // 2) 乙置顶甲的公告 → 200。本节的分界线，别删。
+  const gPin = await G.patch(`/announcements/${aid}`, { isPinned: true });
+  eq('乙置顶别人的公告 200', 200, gPin.status);
+
+  // 3) 读回来：内容一个字没变，但置顶确实生效了。
+  //    只断言 403 是不够的——403 之后内容被改掉也能全绿。
+  const list1 = await F.get('/announcements');
+  const a1 = (list1.body.announcements ?? []).find((x) => x.id === aid);
+  eq('公告还在', true, !!a1);
+  eq('标题没被乙改掉', '周六保洁', a1?.title);
+  eq('内容没被乙改掉', '上午十点来打扫', a1?.content);
+  eq('置顶确实生效了', true, a1?.isPinned);
+
+  // 4) 乙删甲的 → 403，且真的没删掉
+  const gDel = await G.del(`/announcements/${aid}`);
+  eq('乙删别人的公告 403', 403, gDel.status);
+  const list2 = await F.get('/announcements');
+  eq('被拒之后公告还在', true, (list2.body.announcements ?? []).some((x) => x.id === aid));
+
+  // 5) 甲改自己的、删自己的 → 200（别把作者本人也挡在外面）
+  const fEdit = await F.patch(`/announcements/${aid}`, { title: '周六保洁（改期）' });
+  eq('作者改自己的 200', 200, fEdit.status);
+  const list3 = await F.get('/announcements');
+  eq('作者的改动生效了', '周六保洁（改期）', (list3.body.announcements ?? []).find((x) => x.id === aid)?.title);
+
+  const fDel = await F.del(`/announcements/${aid}`);
+  eq('作者删自己的 200', 200, fDel.status);
+  const list4 = await F.get('/announcements');
+  eq('删掉之后列表里没有了', false, (list4.body.announcements ?? []).some((x) => x.id === aid));
+
+  // 6) 反向再走一遍：规则不该是单向的。乙发的，甲同样改不了删不了，
+  //    但置顶照样可以——如果这条挂了而上面那条过了，说明校验写反了。
+  const gPost = await G.post('/announcements', { title: '乙的公告', content: '乙写的内容' });
+  eq('乙也能发公告 201', 201, gPost.status);
+  const gAid = gPost.body.announcement?.id;
+
+  const fEditG = await F.patch(`/announcements/${gAid}`, { content: '甲改的' });
+  eq('甲改乙的公告同样 403', 403, fEditG.status);
+  const fDelG = await F.del(`/announcements/${gAid}`);
+  eq('甲删乙的公告 403', 403, fDelG.status);
+  const fPinG = await F.patch(`/announcements/${gAid}`, { isPinned: true });
+  eq('但甲可以置顶乙的公告', 200, fPinG.status);
+
+  await G.del(`/announcements/${gAid}`);
 }
 
 // ── 总结 ──────────────────────────────────────────────────────────

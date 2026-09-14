@@ -451,6 +451,15 @@ return <AppContext.Provider key={householdId}>…</AppContext.Provider>; // 正�
 
   两处教训：**改列的位置时，要 grep 列名而不是只改自己记得的那几处**（`SELECT *` 不会出错，手写列名才会）；**`void` 掉的 promise 是个静默失败漏斗**，加新端点时顺手补一条 E2E 断言比事后排查便宜得多。现在第 12 节覆盖了它，含 `hasPin`。
 
+- **从生产库挑选着删数据时，两个坑（2026-09 清 E2E 残留时踩的）：**
+
+  1. **`sessions.active_household_id` 有外键指向 `households`。** 删房间之前必须先把会话删掉（或改指别处），否则撞 `FOREIGN KEY constraint failed`。这条特别容易漏，因为 `sessions` 看起来是「认证表」，心态上不觉得它是 `households` 的子表——**查引用关系要用 `SELECT name FROM sqlite_master WHERE sql LIKE '%REFERENCES households%'`，别靠猜**。
+  2. **判据不要从「你这轮正在删的表」里推。** 第一版把「测试房间」写成 `households WHERE id IN (SELECT household_id FROM members GROUP BY …)`，而 `members` 已经被同一脚本前面那条删空了——判据当场变成空集，**一条房间都没删掉，但 `success: true`**。要么把判据先快照下来，要么换一个与删除顺序无关的判据（「一条成员行都没有的房间」+「没有会话指向它」）。
+
+  > 顺带一条 D1 限制：**`CREATE TEMP TABLE` 不可用**，报 `not authorized: SQLITE_AUTH`。所以「先把判据快照进临时表」这条常规解法在这里行不通，只能靠拆分语句和换判据。
+  >
+  > 这种脚本**改完一定要回读一次状态**（`账号 / 房间 / 成员 / 空房间` 各多少 + `npm run db:verify`），别只看 `success: true`——上面第 2 条就是「成功但什么都没做」。
+
 ## 已知限制
 
 **多标签页共享同一个 cookie。** 在标签页 A 切到另一个房间，标签页 B 并不知道，会继续往它记忆中的旧房间写数据。

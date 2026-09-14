@@ -83,7 +83,26 @@ curl -X PUT "https://api.cloudflare.com/client/v4/accounts/<账户ID>/workers/su
 | `CLOUDFLARE_API_TOKEN` | Cloudflare 后台 → My Profile → API Tokens → Create Token → 用 **Edit Cloudflare Workers** 模板 |
 | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare 后台 → Workers & Pages → 右侧栏的 Account ID |
 
-Token 存在 GitHub 的加密区，不会出现在日志里，也不会进代码。**没配 Secret 之前部署任务会直接报错并提示**，不会静默跳过。
+Token 存在 GitHub 的加密区，不会出现在日志里，也不会进代码。**没配 Secret 之前部署任务会直接报错并提示**，不会静默跳过——失败点在「检查凭据」这一步，此时 `build` 和 `部署` 都被 skip 掉，一行代码都没执行，是设计好的 fail fast。
+
+### Token 的权限只需要 Workers（实测确认）
+
+`wrangler deploy` **只用到 Workers Scripts: Edit**，所以「Edit Cloudflare Workers」模板给的权限是够的，不需要额外加 D1。
+
+实测（2026-09）：一个只有 Workers 权限、没有 D1 权限的 token——
+
+```
+GET /accounts/<id>/workers/scripts   → 200   ← 部署要的就是这个
+GET /accounts/<id>/d1/database       → 401 Authentication error
+```
+
+用**只有这个 token** 的环境跑 `npm run deploy` 成功，版本号正常推进。所以不必为了 CI 去放宽 token 权限。
+
+**但要知道它的边界**：这个 token **跑不了** `npm run db:remote` / `npm run db:verify`（那两个要 D1 权限）。改数据库仍然用本机的 `wrangler login` 登录态，别拿 CI 的 token 替。
+
+⚠️ **建 token 时如果填了 End date，到期那天 CI 会开始失败**，而报错仍然是「检查凭据」那一套，很难联想到是过期。要么设成永不过期，要么把日期记在别处。
+
+⚠️ **`/user/tokens/verify` 认不了 Cloudflare 2026 年新的带前缀格式**（`cfut_` + 40 位 + 8 位校验和 = 53 字符）。拿它验 token 会得到 `6111 Invalid format for Authorization header`，**这不代表 token 有问题**——`wrangler 4.131.1` 能正常识别（`whoami` 会显示「logged in with an User API Token」）。想验就用 `GET /accounts/<id>/workers/scripts`。
 
 CI 里的两处特殊处理，改动前请先理解：
 

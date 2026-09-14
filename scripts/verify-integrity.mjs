@@ -4,48 +4,80 @@
  *   npm run db:verify:local     # 本地
  *   npm run db:verify           # 线上
  *
- * 有非零项就打印出来并以退出码 1 结束——这样它能当 CI / 上线流程里的关卡用，
+ * 有非零项就打印出来并以退出码 1 结束——这样它能当上线流程里的关卡用，
  * 而不需要有人去读一坨 JSON 自己数。
  *
- * 为什么要有这个包装：`wrangler d1 execute --file` 的输出是一串 result set，
- * 直接看既费眼又容易漏。判读这件事应该交给机器。
+ * ⚠️ 为什么逐条 `--command` 而不是整份文件 `--file`：
+ *    本地（Miniflare）和线上（真 D1）对 `--file` 的处理**不一样**。
+ *    本地会把每条语句的结果集都返回；线上走的是 import 通道，只返回一个汇总
+ *    （`Total queries executed: N`），拿不到任何行。用它做校验的话，线上会
+ *    「跑了 5 条语句、0 项非零」——看起来全绿，其实一行数据都没检查。
+ *    逐条 `--command` 两边都返回行，行为一致。
  */
 
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 
 const remote = process.argv.includes('--remote');
 const where = remote ? '--remote' : '--local';
 
+/**
+ * 把 SQL 文件切成一条条语句。
+ *
+ * 先剥掉 `--` 行注释再按 `;` 切。verify-integrity.sql 里刻意不含**任何**
+ * 出现在字符串或注释中间的分号，所以这个朴素切法是安全的——改那个文件时
+ * 请保持这个性质，否则这里会静默地切出半条语句。
+ */
+function splitStatements(sql) {
+  return sql
+    .split('\n')
+    .map((line) => line.replace(/--.*$/, ''))
+    .join('\n')
+    .split(';')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 // 直接用 node 跑 wrangler 的入口脚本，而不是 `npx` / `npx.cmd`。
 // Node 24 起在 Windows 上禁止 spawnSync 直接执行 .cmd（抛 EINVAL），
-// 而 `shell: true` 又会把参数拼成字符串。绕开整个 .cmd 层最省事，
-// 顺带让子进程和当前用的是同一个 node。
-const out = execFileSync(
-  process.execPath,
-  [
-    'node_modules/wrangler/bin/wrangler.js',
-    'd1',
-    'execute',
-    'hezu-db',
-    where,
-    '--json',
-    '--file=./scripts/verify-integrity.sql',
-  ],
-  { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-);
-
-// wrangler 在 JSON 前面还会打几行 banner，从第一个 [ 开始才是结果
-const start = out.indexOf('[');
-if (start < 0) {
-  console.error('没找到 JSON 输出，wrangler 可能报错了：\n' + out);
-  process.exit(1);
+// 而 `shell: true` 又会把参数拼成字符串。
+function runSql(sql) {
+  const out = execFileSync(
+    process.execPath,
+    [
+      'node_modules/wrangler/bin/wrangler.js',
+      'd1',
+      'execute',
+      'hezu-db',
+      where,
+      '--json',
+      '--command',
+      sql,
+    ],
+    { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
+  );
+  const start = out.indexOf('[');
+  if (start < 0) throw new Error('没找到 JSON 输出，wrangler 可能报错了：\n' + out);
+  const sets = JSON.parse(out.slice(start));
+  return sets.flatMap((s) => s.results ?? []);
 }
-const sets = JSON.parse(out.slice(start));
 
+const statements = splitStatements(readFileSync('./scripts/verify-integrity.sql', 'utf8'));
+
+const EXPECTED_TOTAL = 27;
 let total = 0;
 const bad = [];
-for (const set of sets) {
-  for (const row of set.results ?? []) {
+
+for (const stmt of statements) {
+  let rows;
+  try {
+    rows = runSql(stmt);
+  } catch (err) {
+    console.error(`\x1b[31m这条语句执行失败：\x1b[0m\n${stmt}\n`);
+    console.error(err.message ?? err);
+    process.exit(1);
+  }
+  for (const row of rows) {
     total++;
     if (row.bad_rows !== 0) bad.push(row);
   }
@@ -53,14 +85,13 @@ for (const set of sets) {
 
 console.log(`数据完整性：检查 ${total} 项（${remote ? '线上' : '本地'}）`);
 
-// 项数对不上说明文件被改坏了（比如又把 UNION ALL 合并回去，撞上 D1 那个
-// 5 项的复合 SELECT 上限，整条语句会被整段丢掉而不报错）。
-const EXPECTED = 27;
-if (total !== EXPECTED) {
+// 项数对不上说明文件被改坏了（比如又把语句合并回一个大 UNION ALL，
+// 撞上 D1 那个 5 项的复合 SELECT 上限，整条语句被丢掉而不报错）。
+if (total !== EXPECTED_TOTAL) {
   console.error(
-    `\x1b[31m检查项数不对：期望 ${EXPECTED} 项，实际 ${total} 项。\x1b[0m\n` +
-      '多半是 verify-integrity.sql 里的某条语句执行失败了——D1 的复合 SELECT ' +
-      '上限是 5 项，超了会整条语句被丢掉。',
+    `\x1b[31m检查项数不对：期望 ${EXPECTED_TOTAL} 项，实际 ${total} 项。\x1b[0m\n` +
+      '多半是 verify-integrity.sql 里的某条语句执行失败了，或被人合并回了大的 ' +
+      'UNION ALL——D1 的复合 SELECT 上限是 5 项，超了会整条语句被丢掉。',
   );
   process.exit(1);
 }

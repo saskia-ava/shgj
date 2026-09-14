@@ -24,6 +24,19 @@ import { join } from 'node:path';
 
 const BASE = process.env.HZM_BASE ?? 'http://localhost:5173/api';
 
+/**
+ * 这套测试既可以打本地 dev server，也可以打线上：
+ *
+ *   node scripts/e2e-phase2.mjs
+ *   HZM_BASE=https://<你的域名>/api node scripts/e2e-phase2.mjs
+ *
+ * ⚠️ 第 12 节要直接改库。改库那条命令的目标必须跟着 BASE 走——
+ *    写死 `--local` 的话，打线上时 UPDATE 落在了本地库上，
+ *    那一节在线上**什么都没验证**，却会全绿通过。
+ */
+const IS_LOCAL = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])/.test(BASE);
+const DB_FLAG = IS_LOCAL ? '--local' : '--remote';
+
 let pass = 0;
 const failures = [];
 
@@ -87,6 +100,21 @@ class Jar {
   post = (p, b) => this.req('POST', p, b ?? {});
   patch = (p, b) => this.req('PATCH', p, b ?? {});
   del = (p) => this.req('DELETE', p);
+}
+
+/**
+ * 拿一个 .sql 文件去打数据库（第 12 节用）。
+ *
+ * 直接用 node 跑 wrangler 的入口脚本，而不是 `npx` / `npx.cmd`：
+ * Node 24 起在 Windows 上禁止 spawnSync 直接执行 .cmd（抛 EINVAL），
+ * 而 `shell: true` 会把参数拼成字符串（既有注入面，又有一条 DeprecationWarning）。
+ */
+function runSqlFile(file) {
+  execFileSync(
+    process.execPath,
+    ['node_modules/wrangler/bin/wrangler.js', 'd1', 'execute', 'hezu-db', DB_FLAG, `--file=${file}`],
+    { stdio: 'pipe' },
+  );
 }
 
 const PW = 'correct-horse-1';
@@ -482,6 +510,7 @@ section('12. 越权：直接改库绕过路由校验（fail closed）');
   await D.post('/auth/register', { email: D_MAIL, password: PW });
   const own = await D.post('/auth/household', { householdName: 'D 的房间', memberName: 'D' });
   eq('D 建房成功', 201, own.status);
+  const ownHouseholdId = own.body.household?.id;
 
   // 把 D 的会话指向 H1——D 不是 H1 的成员。
   // 路由层的校验被完全绕过，只剩 requireAuth 的 LEFT JOIN 兜底。
@@ -489,38 +518,48 @@ section('12. 越权：直接改库绕过路由校验（fail closed）');
   // 走 --file 而不是 --command：SQL 里有空格和括号，交给 shell 传参会被拆成
   // 一堆「未知参数」。临时文件顺带把引号问题整个消掉。
   const sqlFile = join(tmpdir(), `hzm-tamper-${Date.now()}.sql`);
+  const restoreFile = join(tmpdir(), `hzm-restore-${Date.now()}.sql`);
   writeFileSync(
     sqlFile,
     `UPDATE sessions SET active_household_id='${H1}'\n WHERE account_id=(SELECT id FROM accounts WHERE email='${D_MAIL}');\n`,
   );
+  // 测试要自己收尾：篡改完不还原的话，这条会话会永远指向一个自己不在的房间，
+  // 于是 `npm run db:verify` 的 `session without membership` 会一直非零，
+  // 把真正的信号淹掉。
+  writeFileSync(
+    restoreFile,
+    `UPDATE sessions SET active_household_id='${ownHouseholdId}'\n WHERE account_id=(SELECT id FROM accounts WHERE email='${D_MAIL}');\n`,
+  );
   try {
-    // 直接用 node 跑 wrangler 的入口脚本。Node 24 起在 Windows 上禁止
-    // spawnSync 直接执行 .cmd（EINVAL），而 shell:true 会把参数拼成字符串
-    // （既有注入面，又有一条 DeprecationWarning）。
-    execFileSync(
-      process.execPath,
-      ['node_modules/wrangler/bin/wrangler.js', 'd1', 'execute', 'hezu-db', '--local', `--file=${sqlFile}`],
-      { stdio: 'pipe' },
-    );
+    runSqlFile(sqlFile);
+    try {
+      const r = await D.get('/balance');
+      eq('库被篡改后业务接口 403', 403, r.status);
+      eq('返回 NO_MEMBERSHIP', 'NO_MEMBERSHIP', r.body.code);
+
+      const me = await D.get('/auth/me');
+      eq('被篡改后 /auth/me 仍是 200（不是登录失效）', 200, me.status);
+      eq('/me 里 household 降级为 null', null, me.body.household);
+      eq('/me 里 households 仍列出自己真正在的房间', 1, me.body.households?.length);
+      eq('那条被篡改的会话没泄露 H1 的任何信息', 'D 的房间', me.body.households?.[0]?.name);
+
+      const exp = await D.get('/expenses');
+      eq('账目接口同样 403，拿不到 H1 的数据', 403, exp.status);
+
+      const sw = await D.post('/auth/switch', { householdId: H1 });
+      eq('且无法借此把自己合法化', 403, sw.status);
+    } finally {
+      runSqlFile(restoreFile);
+    }
   } finally {
     rmSync(sqlFile, { force: true });
+    rmSync(restoreFile, { force: true });
   }
 
-  const r = await D.get('/balance');
-  eq('库被篡改后业务接口 403', 403, r.status);
-  eq('返回 NO_MEMBERSHIP', 'NO_MEMBERSHIP', r.body.code);
-
-  const me = await D.get('/auth/me');
-  eq('被篡改后 /auth/me 仍是 200（不是登录失效）', 200, me.status);
-  eq('/me 里 household 降级为 null', null, me.body.household);
-  eq('/me 里 households 仍列出自己真正在的房间', 1, me.body.households?.length);
-  eq('那条被篡改的会话没泄露 H1 的任何信息', 'D 的房间', me.body.households?.[0]?.name);
-
-  const exp = await D.get('/expenses');
-  eq('账目接口同样 403，拿不到 H1 的数据', 403, exp.status);
-
-  const sw = await D.post('/auth/switch', { householdId: H1 });
-  eq('且无法借此把自己合法化', 403, sw.status);
+  // 收尾之后应该能正常用了——顺带证明还原确实生效，
+  // 而不是「403 了所以看起来对」。
+  const after = await D.get('/balance');
+  eq('还原后 D 又能正常访问自己的房间', 200, after.status);
 }
 
 // ── 总结 ──────────────────────────────────────────────────────────

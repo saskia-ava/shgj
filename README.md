@@ -123,13 +123,48 @@ SELECT s.account_id, s.active_household_id AS household_id,
 
 这是**结构性**约束，不是记性能小抄：
 
-- 单次 6,000 轮 ≈ 2~4ms，两次就把 Workers 免费版 10ms 的 CPU 预算吃光，接口直接 Error 1102
 - 所以**建房 / 加入房间不再顺带设 PIN**——PIN 是建房之后一个独立的可选步骤
-- 所以**改密码拆成两个请求**：`POST /auth/password/verify`（验旧的，1 次）→ 5 分钟内 `POST /auth/password`（算新的，1 次）。合并成一个接口的直觉做法是两次 PBKDF2，直接超限
+- 所以**改密码拆成两个请求**：`POST /auth/password/verify`（验旧的，1 次）→ 5 分钟内 `POST /auth/password`（算新的，1 次）。合并成一个接口的直觉做法是两次 PBKDF2
 - PIN 用 1,000 轮，所以「验旧 PIN + 算新 PIN」这个唯一的两段式路径仍然安全（`test/auth.test.ts` 里有一条断言专门守住它不超过一次密码哈希的成本）
 - **不做「登录成功时静默重算哈希升级轮数」**——它会给每次成功登录加上第二次 PBKDF2，而且只在成功时触发，是最不容易注意到的路径
 
 **客户端预哈希被明确否决**：它要求把 pepper 下发到浏览器，等于扔掉「数据库泄露也爆破不动」这个核心性质。
+
+#### 但这条规则防的不是你以为的那个东西（2026-09 实测修正）
+
+原始理由是「两次 PBKDF2 会把免费版 10ms CPU 预算吃光」。**实测下来这个前提不成立**，有两个独立的发现：
+
+**一、10ms 上限在这个账号上根本没有被强制。** `wrangler tail` 抓到的 51 个请求里，`register` 跑到 **24ms** 仍然是 `outcome: "ok"`、返回 201。真被掐掉时 `outcome` 会是 `exceededCpu`、响应体是 Error 1102，一次都没出现。（当时 grep `1102` 出来的 10 个「命中」全是 hex 串里的子串，不是错误码。判断依据要看 `outcome`，不是看 CPU 数字。）
+
+**二、CPU 时间和 PBKDF2 轮数几乎无关，大头是 D1 往返。** 稳态（第 3 轮探测）实测：
+
+| 端点 | PBKDF2 | D1 写 | 稳态 CPU |
+|---|---|---|---|
+| `POST /auth/household` | **0 次** | 3 | 2~6ms（冷启动时 19ms） |
+| `POST /auth/pin` | 1×1000 | 1 | 2~3ms |
+| `POST /auth/password` | 1×6000 | 1 | 6~8ms |
+| `POST /auth/login`（成功） | 1×6000 | 2 | 10~12ms |
+| `POST /auth/login`（账号不存在） | 1×6000 | **0** | 2~7ms |
+
+`household` 一次 PBKDF2 都不跑，冷启动时照样 19ms；成功/失败登录跑的是**同一次** PBKDF2(6000)，差值全在写库那两次上。所以如果哪天 10ms 真的开始强制，第一个挂的不是密码端点而是**写库多的业务端点**，靠压 PBKDF2 轮数救不了。
+
+**「≤1 次 PBKDF2」这条规则保留**：它不贵、是免费的保险，而且轮数一旦上去就下不来（老哈希还认）。但不要再用「超了会 Error 1102」当它的理由——真正的理由是「轮数长了是本机测不出来的那种贵」。
+
+**测量方法**（`scripts/measure-cpu.mjs`，`npm run cpu:probe`）：
+
+```bash
+# 终端 1：大陆网络下 tail 走 WebSocket，和 HTTP 一样会被墙，必须带代理
+NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 npx wrangler tail --format json
+# 终端 2：注意 Node 的 fetch 不自动读 HTTPS_PROXY，也要显式打开
+NODE_USE_ENV_PROXY=1 HTTPS_PROXY=http://127.0.0.1:7890 \
+  HZM_BASE=https://hezu-life-manager.hezu-home.workers.dev/api node scripts/measure-cpu.mjs
+# 至少跑三轮，然后
+node scripts/measure-cpu.mjs --report tail.json     # 按端点汇总
+node scripts/measure-cpu.mjs --samples tail.json    # 按发生顺序逐条看
+```
+
+**为什么要跑三轮**：一轮里每个端点只有 1 个样本，冷启动的摊销全落在那轮的头几个请求上，`register` 看起来就是 24ms；到第 3 轮才降到 15ms 以下。`--samples` 就是用来分辨冷启动和真实成本的——同一点连着几轮一路下降是冷启动，一直高才是真贵。
+**一条都没抓到时脚本会报错退出而不是报绿**：tail 连不上或者探测没跑都会得到空文件，此时打印「全部低于 10ms」和真的达标长得一模一样。
 
 ### 恢复码
 
@@ -224,9 +259,9 @@ return <AppContext.Provider key={householdId}>…</AppContext.Provider>; // 正�
 - **认领成员档案必须用条件 UPDATE + 检查 `meta.changes`**，绝不能写成「先 SELECT 再 UPDATE」。两个请求同时认领同一条档案时，后者会顶替前者并**继承对方的余额**。`WHERE account_id IS NULL` 是唯一能挡住这件事的地方。
 - **加入房间时要连「已退租」的旧档案一起找。** 只查在住的话，退租再搬回来会新建一条身份，历史账目留在一条他已经够不着的旧身份上——`Σ balance === 0` 依然成立（退租者仍参与计算），但他自己的欠款在界面上凭空消失。部分唯一索引 `idx_members_account_active` 只约束 `is_active = 1`，正是为了让这条路复用同一条 `members.id`。
 - **同名成员要拦住。** 不拦会静默建出第二个「小红」，账目仍然算得对（成员 id 不同），但 PIN 登录页会让用户在两个一模一样的名字里猜哪个是自己。注意这是「要求加区分」而不是「禁止同名」。
-- **Workers 免费版单请求只有 10ms CPU**，超了会返回 Error 1102。
-  **选轮数不能信本机基准**——本机 Node 比 Cloudflare 快约 3 倍：25,000 轮在本机是 3.3ms（看着很安全），线上实测却是 10~14ms，直接超限。现在定在 6,000 轮，线上实测登录接口 5~7ms。
-  改轮数前必须先 `npx wrangler tail --format json` 实测 `cpuTime`，别照本机数字拍脑袋。轮数写在哈希串里，改动不会让老哈希失效。
+- **选轮数不能信本机基准**——本机 Node 比 Cloudflare 快约 3 倍：25,000 轮在本机是 3.3ms（看着很安全），线上实测却是 10~14ms。现在定在 6,000 轮。
+  改轮数前必须先线上实测 `cpuTime`（`npm run cpu:probe` + `wrangler tail`，见下节），别照本机数字拍脑袋。轮数写在哈希串里，改动不会让老哈希失效。
+- **实测发现 CPU 大头不是 PBKDF2，是 D1 写。** 见下节，这条改变了「该防什么」的判断。
 
 ## 已知限制
 
@@ -235,6 +270,22 @@ return <AppContext.Provider key={householdId}>…</AppContext.Provider>; // 正�
 已经做的缓解：切房时 `AppContext.Provider` 上的 `key={householdId}` 会强制整棵子树卸载重建（所有页面的 `useState` 归零，避免「切到 B 房但记账页还预填着 A 房成员」）；标签页重新可见时会重新拉一次 `/me` 对账。
 
 **但这只解决了「切回来的时候能发现」，切过去的瞬间仍可能往错的房间写一两条。** 彻底解决需要跨标签页通信（`BroadcastChannel` + 写操作前校验），成本远大于收益，所以不做，写成已知问题而不是假装不存在。
+
+**邮箱是否注册过，可以从响应耗时枚举出来。** `POST /auth/login` 在账号不存在时会对一个假哈希跑一次等价的 PBKDF2（`dummyVerify`），把 PBKDF2 那一段的耗时拉平——**但那只是成功路径上的一小部分**。账号存在时还要 `clearFailedAttempts`（UPDATE）、`createSession`（INSERT）、`buildSessionPayload`（若干 SELECT），不存在时一次写都没有。
+
+线上实测（2026-09，40 次交替采样）：
+
+```
+账号存在    min 385.7ms   p50 403.1ms
+账号不存在  min 265.5ms   p50 282.9ms
+            ↑ 中位数差 120.2ms，最小值的差 120.3ms —— 差值稳定，不是抖动
+```
+
+两组的最值有重叠（成功组最慢 969ms，失败组最快 265ms），但重复采样十几次取中位数就能稳定区分。
+
+**为什么不修**：彻底的修法是让失败路径也做一次等价的写（比如插入一行再删掉）。那等于给未认证请求开放 D1 写放大——任何人都能用不存在的邮箱刷写操作，而 D1 的写是这套架构里最贵的资源。用「未认证可触发的写放大」换「邮箱存在性保密」不划算。
+
+真实的危害有限：知道某个邮箱注册过，并不带来密码（有 pepper + 6,000 轮 PBKDF2 + 5 次失败锁定 15 分钟）。所以这里如实记录，而不是留一句看起来在防、实际没防住的注释。
 
 **`NO_MEMBERSHIP` 不能当成 401 处理。** 它表示「登录着，但当前房间下没有身份」（还没选房间，或已退租）。当成 401 会把人踢回登录页，而**他重登一次会回到完全一样的状态，永远出不来**。前端按错误码分流到「回房间选择页」。
 

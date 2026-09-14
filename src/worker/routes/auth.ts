@@ -276,8 +276,10 @@ auth.post('/login', async (c) => {
       locked_until: number | null;
     }>();
 
-  // 账号不存在时也要跑一次等价的 PBKDF2，否则响应耗时能区分「注册过」和
-  // 「没注册过」，等于给了一个枚举已注册邮箱的接口。
+  // 账号不存在时也要跑一次等价的 PBKDF2，把 PBKDF2 那一段的耗时拉平。
+  // ⚠️ 拉平的**只有** PBKDF2 那一段：下面成功路径还要写两次库（clearFailedAttempts
+  //    + createSession），失败路径一次都不写，线上实测墙钟差 120ms。
+  //    所以这**不是**一个能防住邮箱枚举的措施，详见 auth.ts 里 dummyVerify 的注释。
   if (!account) {
     await dummyVerify(pepper);
     return c.json(errorBody('INVALID_CREDENTIALS', '邮箱或密码不正确'), 401);

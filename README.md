@@ -190,6 +190,24 @@ npm run db:verify         # 应用后核对表/索引/悬空引用，有非零�
 ### 三条纪律
 
 1. **`0001_init.sql` 之后永不修改。** 它是纯 CREATE，不含任何 DROP，是整条迁移链的基线。
+
+   **注意它的内容是「第二期之后」的状态**：`accounts` / `member_pins` / `recovery_codes`、`sessions` 的 `account_id` + `active_household_id`、`idx_members_account_active` 部分唯一索引都已经在里面了，**不存在 `0002`**。
+
+   这是刻意的。第二期走的是「线上清库重建」而不是写数据迁移（理由见下），所以基线被**一次性重写**成重建后的形状，然后冻结。下次要加表，从 `0002` 开始建。
+
+   > 为什么当初选重建而不是写迁移：`expenses.created_by` 和 `chores.member_ids` 是**裸引用**，写迁移时任何一次重建 member 行都会让它们静默悬空，而 `Σ balance === 0` 这个断言检查不出来。趁库还只有冒烟测试数据时重建，是唯一能免费补上这两处约束的机会。
+
+   重建的完整顺序（已执行过一次，`scripts/reset-remote-db.sql` 里也写着）：
+
+   ```bash
+   npx wrangler d1 export hezu-db --remote --output=backup-before-rebuild.sql
+   # ⚠️ 先打开备份看一眼再删。上次导出里是 23 个 @example.com 测试账号、
+   #    0 个真实用户——"确认里面只有测试数据"这一步不能省
+   npx wrangler d1 execute hezu-db --remote --file=./scripts/reset-remote-db.sql
+   npm run db:remote && npm run db:verify && npm run test:e2e
+   ```
+
+   `reset-remote-db.sql` **绝不能**放进 `migrations/`——放进去的话，任何人重置 `d1_migrations` 后跑 `migrations apply`，它会真的执行并清空生产库，而且看起来就像一次正常的迁移。它必须连 `d1_migrations` 一起删：不删的话 `migrations apply` 会输出「✅ No more migrations to apply」然后给你留下一张空库，**这个失败模式看起来完全像成功**。
 2. **已应用的迁移文件禁止修改内容。** wrangler 只比对**文件名**，不存校验和。改内容既不重跑也不报错，结果是 commit 里的 schema 和线上库不一致，**且没有任何信号**。要改就新建一个迁移。
 3. **文件里不写任何事务控制语句。** D1 会把整个迁移文件包在一个事务里；写 `BEGIN TRANSACTION;` 会被 wrangler 剥掉，写 `BEGIN;` 不会被剥掉，会被原样发给 D1 在已有事务里再开一个事务然后报错。
 

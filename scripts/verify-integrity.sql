@@ -36,6 +36,26 @@ SELECT 'missing index: ' || j.value AS check_name,
        1 - (SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = j.value) AS bad_rows
   FROM json_each('["idx_accounts_email","idx_members_account_active"]') j;
 
+-- ── 表是不是**多**了 ──────────────────────────────────────────────
+-- 上面那条只查「少」，查不出「多」。而多出来的表恰恰是重置脚本漏删的症状：
+-- 第二期新增 accounts / member_pins / recovery_codes 时 reset-remote-db.sql
+-- 没有跟着加，于是重置后这三张表连同里面的测试账号留在库里，而 migrations
+-- 再跑到 `CREATE TABLE accounts` 就会撞「表已存在」。核对表清单这一条
+-- 是唯一能在重置之后、迁移之前发现它的地方。
+--
+-- 加表时这里和 reset-remote-db.sql 都要改——这点摩擦是故意的。
+
+-- 恒返回一行（好用 COUNT 表达），所以检查总项数是固定的 27 项，
+-- 不会因为「这次恰好没有多出来的表」而少一项。
+
+SELECT 'unexpected table' AS check_name, COUNT(*) AS bad_rows
+  FROM sqlite_master
+ WHERE type = 'table'
+   AND name NOT LIKE 'sqlite_%'
+   AND name NOT LIKE '_cf%'
+   AND name <> 'd1_migrations'
+   AND name NOT IN (SELECT value FROM json_each('["accounts","recovery_codes","households","members","member_pins","expenses","expense_shares","settlements","chores","chore_logs","announcements","items","sessions"]'));
+
 -- ── 悬空引用（第一组）─────────────────────────────────────────────
 -- 这些字段没有外键约束（或约束在 D1 上不生效），只能靠这一步发现。
 -- 历史账目指向一个不存在的成员时，界面会显示空白名字，账目也再对不平。
@@ -81,14 +101,29 @@ SELECT 'duplicate active membership' AS check_name, COUNT(*) AS bad_rows FROM (
    WHERE account_id IS NOT NULL AND is_active = 1
    GROUP BY account_id, household_id HAVING COUNT(*) > 1
 )
--- 会话指向的房间该账号其实不在里面。正常情况恒为 0。非 0 说明有人手工改过
--- sessions 表，而 requireAuth 的 LEFT JOIN 会把这类请求挡在 403（fail closed），
--- 不会泄露数据——这一条是在确认那道防线确实在生效。
+-- 会话指向一个该账号**完全没有任何关系**的房间。非 0 说明有人手工改过
+-- sessions 表（或 /auth/switch 的 EXISTS 守卫有 bug），而 requireAuth 的
+-- LEFT JOIN 会把这类请求挡在 403（fail closed），不会泄露数据——
+-- 这一条是在确认库里没有这种行。
+--
+-- ⚠️ 这里刻意**不**要求 `m.is_active = 1`。加了就是错的，而且这个错很隐蔽：
+--    `POST /members/:id/leave` 只改 `members.is_active = 0` 和 `move_out`，
+--    **不碰** `sessions.active_household_id`。所以「退租了、还没重新加入」
+--    这个合法状态长这样：members 行在、is_active = 0、会话仍指向那个房间。
+--    加上 is_active = 1 就会把它判成数据损坏——而这是**会长期存在**的状态，
+--    不是某个瞬间，所以它会一直红着，直到真正的信号被淹掉。
+--
+--    实测方法（改这条之前请自己复现一遍）：随便挑一条
+--    `active_household_id IS NOT NULL` 的会话，把对应的 members 行改成
+--    `is_active = 0`，两种写法分别查一次——带 is_active = 1 的那个报 1，
+--    不带的报 0；改回 1 之后两个都回 0。
+--
+--    真正的篡改是「连 members 行都没有」（账号跟那个房间毫无关系），
+--    所以只查 NOT EXISTS 成员行，不看它是否在住。
 UNION ALL SELECT 'session without membership', COUNT(*) FROM sessions s
   WHERE s.active_household_id IS NOT NULL
     AND NOT EXISTS (
       SELECT 1 FROM members m
        WHERE m.account_id = s.account_id
          AND m.household_id = s.active_household_id
-         AND m.is_active = 1
     );

@@ -64,7 +64,7 @@ function runSql(sql) {
 
 const statements = splitStatements(readFileSync('./scripts/verify-integrity.sql', 'utf8'));
 
-const EXPECTED_TOTAL = 27;
+const EXPECTED_TOTAL = 28;
 let total = 0;
 const bad = [];
 

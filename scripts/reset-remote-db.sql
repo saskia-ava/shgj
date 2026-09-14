@@ -14,6 +14,13 @@
 -- 顺序：先子表后父表。SQLite 默认不强制外键，顺序其实不影响结果，
 -- 但保持这个顺序是为了让这个文件本身读起来是对的。
 --
+-- ⚠️ **加了新表就要回来加一行。** 漏掉一张表的后果不是「留下点垃圾数据」——
+--    它是 `migrations apply` 在 `CREATE TABLE` 上撞「表已存在」然后整批失败，
+--    而此时前几张表已经建好了，库处于一个迁移没跑完的中间态。
+--    这个文件是第一期写的，第二期加的 accounts / member_pins / recovery_codes
+--    就漏过一次，是靠 `SELECT name FROM sqlite_master` 逐张数出来的。
+--    改完请对一遍：线上业务表应当正好是 13 张（verify-integrity.sql 里有清单）。
+--
 -- 不删 _cf_KV：那是 Cloudflare 自己的内部表。
 
 DROP TABLE IF EXISTS expense_shares;
@@ -23,8 +30,12 @@ DROP TABLE IF EXISTS chore_logs;
 DROP TABLE IF EXISTS chores;
 DROP TABLE IF EXISTS announcements;
 DROP TABLE IF EXISTS items;
+-- 下面三张是第二期（账号体系）新增的，删的次序要在它们引用的表之前
+DROP TABLE IF EXISTS recovery_codes;
+DROP TABLE IF EXISTS member_pins;
 DROP TABLE IF EXISTS sessions;
 DROP TABLE IF EXISTS members;
+DROP TABLE IF EXISTS accounts;
 DROP TABLE IF EXISTS households;
 
 -- ⚠️ d1_migrations 必须一起删。
